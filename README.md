@@ -51,6 +51,29 @@ Untuk UAT, port aktif adalah `18090` (lihat `APP_ENV`, `PORT`).
 
 Health: `GET /healthz` (liveness) dan `GET /readyz` (database siap).
 
+## Gmail API
+
+Sinkronisasi Gmail memakai **Gmail API + Pub/Sub push** (bukan IMAP), scope
+`gmail.readonly` saja. Nonaktif secara default; tanpa kredensial Google semua fitur lain tetap
+jalan dan rute Gmail menjawab `503 gmail_disabled`.
+
+Endpoint (kontrak: [`docs/GMAIL_API_CONTRACT.md`](docs/GMAIL_API_CONTRACT.md)):
+
+| Method | Path | Auth |
+| --- | --- | --- |
+| `POST` | `/v1/gmail/connect/start` | Bearer PAM |
+| `GET` | `/v1/gmail/connect/callback` | state OAuth (tanpa Bearer) |
+| `GET` | `/v1/gmail/status` | Bearer PAM |
+| `POST` | `/v1/gmail/disconnect` | Bearer PAM |
+| `POST` | `/v1/internal/gmail/push` | JWT OIDC Pub/Sub |
+
+Isi env `GMAIL_*` lalu set `GMAIL_ENABLED=true`; langkah Google Cloud Console, daftar env,
+dan gate yang belum dijalankan ada di [`docs/GMAIL_API_SETUP.md`](docs/GMAIL_API_SETUP.md).
+Refresh token/email/payload push disimpan terenkripsi; raw MIME hanya diproses di memori dan
+PAN/No. Referensi tidak pernah disimpan atau di-log. Worker berjalan di dalam proses API dengan
+tick `GMAIL_WORKER_INTERVAL_SECONDS` dan memakai jalur yang sama dengan tombol "Sinkronkan
+sekarang". Tes memakai provider palsu: `./scripts/go.sh test ./internal/gmail -count=1`.
+
 ## Secret dan data
 
 - Secret OAuth Google, refresh token, kunci JWT/enkripsi, kredensial Turso/Azure **tidak boleh**
@@ -65,8 +88,9 @@ cmd/api, cmd/pam-admin     bootstrap HTTP dan utilitas admin
 internal/config            environment + production secret checks
 internal/crypto            AES-256-GCM (kompatibel format Node)
 internal/auth              scrypt, JWT HS256, refresh token
-internal/store             database/sql libSQL + migrasi 001–016
+internal/store             database/sql libSQL + migrasi 001–017
 internal/finance           kalkulator deterministik BR-01…BR-06
+internal/gmail             OAuth/PKCE, klien Gmail API, parser Livin, worker sinkronisasi
 internal/categoryllm       kategorisasi Azure Foundry + cache/budget
 internal/analysis          snapshot analisis
 internal/httpapi           rute HTTP, middleware, validasi
