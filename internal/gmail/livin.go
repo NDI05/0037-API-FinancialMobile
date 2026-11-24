@@ -1,6 +1,7 @@
 package gmail
 
 import (
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,6 +33,9 @@ const TemplateVersion = "gmail-livin-v1"
 
 var (
 	jakarta = mustLoadJakarta()
+	// WITA (Asia/Makassar) and WIT (Asia/Jayapura) are fixed-offset zones, so no tzdata is needed.
+	wita = time.FixedZone("WITA", 8*60*60)
+	wit  = time.FixedZone("WIT", 9*60*60)
 
 	labelKeyPattern = regexp.MustCompile(`(?i)^(penerima|nama penerima|merchant|nama merchant|` +
 		`toko|nama toko|biller|nama biller|merchant name|recipient)\s*[:\-]\s*(.+)$`)
@@ -52,9 +56,18 @@ var (
 	// stacked production layout. Case-insensitive because production prints "Tanggal".
 	dateLabelPattern = regexp.MustCompile(`(?i)\b(?:pkl\.?|tanggal|waktu|pukul)\b\s*`)
 	// indonesianMonths maps the Indonesian month names/abbreviations used by production mail
-	// ("12 Okt 2026", "5 Agustus 2026") to the English tokens the date layouts expect.
-	indonesianMonths = regexp.MustCompile(`(?i)\b(januari|februari|maret|april|mei|juni|juli|` +
-		`agustus|agu|agt|ags|september|oktober|okt|nopember|november|desember|des)\b`)
+	// ("12 Okt 2026", "5 Agustus 2026", "5 Nop 2026") to the English tokens the date layouts
+	// expect. Common short forms seen in older templates are included so a real transaction is
+	// not skipped as event_time_missing.
+	indonesianMonths = regexp.MustCompile(`(?i)\b(januari|jan|februari|pebruari|feb|peb|maret|mar|` +
+		`april|apr|mei|juni|jun|juli|jul|agustus|agust|agu|agt|ags|september|sept|sep|oktober|okt|` +
+		`nopember|november|nop|nov|desember|des)\b`)
+	// timezoneTokenPattern identifies the WIB/WITA/WIT marker printed after the time. WITA and WIT
+	// carry real offsets, so the marker selects the location instead of being silently dropped.
+	timezoneTokenPattern = regexp.MustCompile(`(?i)\b(WITA|WIT|WIB)\b`)
+	// bareTimePattern catches a time-only next line ("pkl 09:30:45", "09:30") before the date pair
+	// logic gets a chance to join it with the date.
+	bareTimePattern = regexp.MustCompile(`(?i)^(?:pkl|pukul|waktu|jam)?\.?\s*\d{1,2}[:.]\d{2}`)
 
 	dateLayouts = []string{
 		"02 Jan 2006 15:04:05",
@@ -74,8 +87,6 @@ var (
 		"2006-01-02 15:04:05",
 		"2006-01-02 15:04",
 		"2006-01-02",
-		"02 Jan 2006 15:04 WIB",
-		"02 Jan 2006 15:04:05 WIB",
 	}
 )
 
@@ -112,7 +123,7 @@ func ParseLivinNotification(decoded DecodedMessage) ParsedNotification {
 	case isIdentifierLabel(merchant):
 		result.Reason = "unsafe_merchant"
 	default:
-		result.MerchantLabel = sanitize(merchant)
+		result.MerchantLabel = truncate(sanitize(merchant), 160)
 	}
 	amount, ok := findAmount(lines)
 	if !ok {
@@ -179,6 +190,9 @@ func findLabel(lines []string, reference string) string {
 			key = strings.ToLower(strings.TrimSpace(match[1]))
 			if index+1 < len(lines) {
 				value = strings.TrimSpace(lines[index+1])
+				if looksLikeFieldValue(value) {
+					continue
+				}
 			}
 		}
 		if key == "" {
@@ -222,6 +236,38 @@ func isIdentifierLabel(value string) bool {
 		}
 	}
 	return digits >= 4
+}
+
+// looksLikeFieldValue rejects a bare label's next line when it is actually another email field
+// (amount, date/time, reference). Live templates stack "Penerima" directly above field lines, so
+// without this guard the amount/date line could be stored as the merchant name.
+func looksLikeFieldValue(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return true
+	}
+	// Field lines start with a known label word; a real business name practically never does.
+	for _, prefix := range []string{"nominal", "tanggal", "tgl", "waktu", "pukul", "pkl", "saldo",
+		"jumlah", "no. referensi", "no. ref", "nomor referensi", "referensi", "ref.", "reference",
+		"transaction date", "amount", "total pembayaran"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	if amountPattern.MatchString(value) || standaloneAmountPattern.MatchString(value) {
+		return true
+	}
+	if datePattern.MatchString(value) {
+		return true
+	}
+	if bareTimePattern.MatchString(value) {
+		return true
+	}
+	// A date-looking value carries a month token plus digits ("24 Nov 2026").
+	if indonesianMonths.MatchString(value) && strings.ContainsAny(value, "0123456789") {
+		return true
+	}
+	return false
 }
 
 func findAmount(lines []string) (int64, bool) {
@@ -286,7 +332,7 @@ func parseIDRAmount(raw string) (int64, bool) {
 		return 0, false
 	}
 	// Round to the nearest rupiah: a printed value with cents still has one real IDR amount.
-	minor := int64(value)
+	minor := int64(math.Round(value))
 	if minor <= 0 || minor > 1_000_000_000_000_000 {
 		return 0, false
 	}
@@ -294,26 +340,43 @@ func parseIDRAmount(raw string) (int64, bool) {
 }
 
 func findEventAt(lines []string) (time.Time, bool) {
-	for _, line := range lines {
-		match := datePattern.FindStringSubmatch(line)
-		if match == nil {
-			continue
+	// Production notifications stack the local time on the line after the date, often with other
+	// fields in between: "Tanggal 24 Nov 2026", "No. Referensi ...", "pkl 09:30:45 WIB". Try the
+	// labelled date lines and their nearest neighbours first, preferring a candidate that carries a
+	// time-of-day; a date-only fallback is kept so a date without a printed time still parses.
+	var dateOnly time.Time
+	haveDateOnly := false
+	consider := func(raw string) (time.Time, bool, bool) {
+		parsed, ok := parseDateValue(raw)
+		if !ok {
+			return time.Time{}, false, false
 		}
-		if parsed, ok := parseDateValue(match[1]); ok {
+		timed := parsed.Hour() != 0 || parsed.Minute() != 0 || parsed.Second() != 0
+		if !timed && !haveDateOnly {
+			dateOnly, haveDateOnly = parsed, true
+		}
+		return parsed, true, timed
+	}
+	for index := range lines {
+		if parsed, ok, timed := consider(lines[index]); ok && timed {
 			return parsed, true
+		}
+		for _, offset := range []int{1, -1, 2, -2} {
+			neighbour := index + offset
+			if neighbour < 0 || neighbour >= len(lines) {
+				continue
+			}
+			joined := lines[index] + " " + lines[neighbour]
+			if len(strings.Fields(joined)) < 3 {
+				continue
+			}
+			if parsed, ok, timed := consider(joined); ok && timed {
+				return parsed, true
+			}
 		}
 	}
-	// Production notifications stack the local time on the line after the date, e.g.
-	// "Tanggal 24 Nov 2026" + "pkl 09:30:45 WIB". Joined pairs are tried before single lines so the
-	// time is not lost to a date-only layout.
-	for index := 0; index+1 < len(lines); index++ {
-		joined := lines[index] + " " + lines[index+1]
-		if len(strings.Fields(joined)) < 3 {
-			continue
-		}
-		if parsed, ok := parseDateValue(joined); ok {
-			return parsed, true
-		}
+	if haveDateOnly {
+		return dateOnly, true
 	}
 	for _, line := range lines {
 		if parsed, ok := parseDateValue(line); ok {
@@ -332,7 +395,7 @@ func parseDateValue(raw string) (time.Time, bool) {
 		switch strings.ToLower(word) {
 		case "januari":
 			return "Jan"
-		case "februari":
+		case "februari", "pebruari", "feb", "peb":
 			return "Feb"
 		case "maret":
 			return "Mar"
@@ -344,13 +407,13 @@ func parseDateValue(raw string) (time.Time, bool) {
 			return "Jun"
 		case "juli":
 			return "Jul"
-		case "agustus", "agu", "agt", "ags":
+		case "agustus", "agust", "agu", "agt", "ags":
 			return "Aug"
-		case "september":
+		case "september", "sept", "sep":
 			return "Sep"
 		case "oktober", "okt":
 			return "Oct"
-		case "nopember", "november":
+		case "nopember", "november", "nop", "nov":
 			return "Nov"
 		case "desember", "des":
 			return "Dec"
@@ -358,12 +421,22 @@ func parseDateValue(raw string) (time.Time, bool) {
 			return word
 		}
 	})
-	for _, suffix := range []string{"WIB", "WIT", "WITA"} {
-		raw = strings.ReplaceAll(raw, suffix, "")
+	loc := jakarta
+	if match := timezoneTokenPattern.FindStringSubmatch(raw); match != nil {
+		switch strings.ToUpper(match[1]) {
+		case "WITA":
+			loc = wita
+		case "WIT":
+			loc = wit
+		}
 	}
+	raw = timezoneTokenPattern.ReplaceAllString(raw, "")
 	raw = strings.Join(strings.Fields(raw), " ")
+	// A stacked line starts with the label and its colon ("Tanggal: 24 Nov 2026"); the layouts do
+	// not accept surrounding punctuation, so trim it after the label words are gone.
+	raw = strings.Trim(raw, " :,-\t")
 	for _, layout := range dateLayouts {
-		if parsed, err := time.ParseInLocation(layout, raw, jakarta); err == nil {
+		if parsed, err := time.ParseInLocation(layout, raw, loc); err == nil {
 			return parsed, true
 		}
 	}

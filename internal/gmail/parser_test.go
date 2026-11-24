@@ -241,3 +241,109 @@ pkl 09:30:45 WIB
 		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
 	}
 }
+
+// A bare "Penerima" label stacked directly above another field line must not turn that field into
+// the merchant name (the next line is an amount, a date, or a reference).
+func TestParseLivinStackedLabelRejectsFieldLines(t *testing.T) {
+	for _, nextLine := range []string{
+		"Nominal Transaksi Rp 25.000,00",
+		"Tanggal: 24 Nov 2026 09:30:45",
+		"No. Referensi ABC123XYZ",
+		"pkl 09:30:45 WIB",
+	} {
+		t.Run(nextLine, func(t *testing.T) {
+			body := "Pembayaran Berhasil\n\nPenerima\n" + nextLine + "\n\nTerima kasih.\n"
+			decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed := ParseLivinNotification(decoded)
+			if parsed.Status == "PARSED" {
+				t.Fatalf("field line %q must not become a merchant label: %+v", nextLine, parsed)
+			}
+			if parsed.Reason != "merchant_missing" {
+				t.Fatalf("reason = %q, want merchant_missing", parsed.Reason)
+			}
+		})
+	}
+}
+
+// The date and time lines may have a reference line between them; the time must still be kept
+// instead of silently parsing the date-only layout as midnight.
+func TestParseLivinDateTimeWithInterveningField(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+No. Referensi ABC123XYZ
+pkl 09:30:45 WIB
+`
+	decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := ParseLivinNotification(decoded)
+	if parsed.Status != "PARSED" {
+		t.Fatalf("intervening field must not break parsing: %+v", parsed)
+	}
+	want := time.Date(2026, 11, 24, 9, 30, 45, 0, jakarta)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+}
+
+// WITA/WIT carry real UTC offsets; parsing them as Jakarta would shift the transaction time.
+func TestParseLivinWitaTimezone(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+pkl 09:30:45 WITA
+`
+	decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := ParseLivinNotification(decoded)
+	if parsed.Status != "PARSED" {
+		t.Fatalf("WITA template must parse: %+v", parsed)
+	}
+	want := time.Date(2026, 11, 24, 9, 30, 45, 0, wita)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+	if parsed.EventAt.UTC().Equal(time.Date(2026, 11, 24, 9, 30, 45, 0, jakarta)) {
+		t.Fatal("WITA must not be treated as WIB")
+	}
+}
+
+// Short Indonesian month forms ("Nop", "Peb") appear in older templates.
+func TestParseLivinShortIndonesianMonths(t *testing.T) {
+	cases := map[string]time.Time{
+		"5 Nop 2026": time.Date(2026, 11, 5, 9, 0, 0, 0, jakarta),
+		"2 Peb 2026": time.Date(2026, 2, 2, 9, 0, 0, 0, jakarta),
+	}
+	for dateLine, want := range cases {
+		t.Run(dateLine, func(t *testing.T) {
+			body := "Pembayaran Berhasil\n\nPenerima\nWARUNG SEDERHANA\n\n" +
+				"Nominal Transaksi Rp 25.000,00\nTanggal " + dateLine + "\npkl 09:00 WIB\n"
+			decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed := ParseLivinNotification(decoded)
+			if parsed.Status != "PARSED" {
+				t.Fatalf("short month %q must parse: %+v", dateLine, parsed)
+			}
+			if !parsed.EventAt.Equal(want) {
+				t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+			}
+		})
+	}
+}
