@@ -82,9 +82,9 @@ Tambahan aditif: `"googleLinked": true|false`.
 ## Verifikasi token
 
 - Hanya `RS256`. `alg` lain (termasuk `none`/`HS256`) ditolak.
-- JWKS di-cache ±5 menit, menghormati `kid`; `kid` tak dikenal memicu refetch (dibatasi ~15 detik
-  agar tidak membanjiri Google). Saat JWKS sedang down, key lama tetap dipakai; cache kosong =
-  fail closed.
+- JWKS di-cache ±5 menit, menghormati `kid`; `kid` tak dikenal dan TTL kedaluwarsa memicu refetch
+  yang dibatasi ~15 detik, termasuk setelah fetch gagal, agar outage tidak memperlambat setiap
+  login. Saat JWKS sedang down, key lama tetap dipakai; cache kosong = fail closed.
 - Issuer harus `accounts.google.com` atau `https://accounts.google.com`.
 - Audience harus sama dengan `GOOGLE_SSO_CLIENT_ID`.
 - `exp` wajib; `nbf`/`iat` dicek dengan toleransi clock kecil (~2 menit).

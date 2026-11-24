@@ -203,6 +203,12 @@ func (v *GoogleVerifier) key(ctx context.Context, kid string) (*rsa.PublicKey, e
 		// Unknown kid: likely a Google key rotation, so refetch once, but never on every request.
 		needsRefresh = now.Sub(v.lastAttempt) >= googleJWKSMinRefetch
 	}
+	if needsRefresh && !v.lastAttempt.IsZero() && now.Sub(v.lastAttempt) < googleJWKSMinRefetch {
+		// A fetch was attempted moments ago and either failed or a refresh is still unnecessary:
+		// don't serialize every login behind another network timeout (P2-8). Cached keys keep
+		// working; an empty cache fails closed immediately instead of stalling for seconds.
+		needsRefresh = false
+	}
 	if needsRefresh {
 		v.lastAttempt = now
 		keys, err := v.fetch(ctx)

@@ -220,3 +220,72 @@ func TestGoogleVerifierHandlesJWKSFailureAndRotation(t *testing.T) {
 		t.Fatalf("jwks outage error = %v", err)
 	}
 }
+
+func TestGoogleVerifierThrottlesJWKSRefetchAfterFailure(t *testing.T) {
+	key := newGoogleTestKey(t)
+	var fetches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	clock := &googleTestClock{at: time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)}
+	verifier := NewGoogleVerifier(googleTestClientID, server.URL, server.Client(), clock.now)
+	token := signGoogleToken(t, key, "kid-1", "RS256", googleClaims(clock.at))
+	// An unreachable JWKS with an empty cache fails closed; the throttle keeps the next requests
+	// from each paying a fresh network timeout.
+	for attempt := 0; attempt < 3; attempt++ {
+		if _, err := verifier.Verify(context.Background(), token, "nonce-1"); !errors.Is(err,
+			ErrGoogleInvalidToken) {
+			t.Fatalf("attempt %d error = %v", attempt, err)
+		}
+	}
+	if fetches.Load() != 1 {
+		t.Fatalf("fetches = %d, want 1 (throttled)", fetches.Load())
+	}
+	// After the throttle window one retry is allowed, so a recovered/slow endpoint is re-probed.
+	clock.at = clock.at.Add(googleJWKSMinRefetch + time.Second)
+	if _, err := verifier.Verify(context.Background(), token, "nonce-1"); !errors.Is(err,
+		ErrGoogleInvalidToken) {
+		t.Fatalf("post-window error = %v", err)
+	}
+	if fetches.Load() != 2 {
+		t.Fatalf("fetches = %d, want 2", fetches.Load())
+	}
+}
+
+func TestGoogleVerifierServesStaleKeysDuringJWKSOutage(t *testing.T) {
+	key := newGoogleTestKey(t)
+	var healthy atomic.Bool
+	healthy.Store(true)
+	var fetches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !healthy.Load() {
+			http.Error(w, "down", http.StatusInternalServerError)
+			return
+		}
+		fetches.Add(1)
+		googleJWKSHandler(map[string]*rsa.PublicKey{"kid-1": &key.PublicKey})(w, r)
+	}))
+	t.Cleanup(server.Close)
+	clock := &googleTestClock{at: time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)}
+	verifier := NewGoogleVerifier(googleTestClientID, server.URL, server.Client(), clock.now)
+	token := signGoogleToken(t, key, "kid-1", "RS256", googleClaims(clock.at))
+	if _, err := verifier.Verify(context.Background(), token, "nonce-1"); err != nil {
+		t.Fatal(err)
+	}
+	// TTL expires while Google's JWKS is unreachable: the stale key still validates, but the failed
+	// refresh is not repeated on the next request.
+	healthy.Store(false)
+	clock.at = clock.at.Add(6 * time.Minute)
+	refreshesBefore := fetches.Load()
+	if _, err := verifier.Verify(context.Background(), token, "nonce-1"); err != nil {
+		t.Fatalf("stale-key verify: %v", err)
+	}
+	if _, err := verifier.Verify(context.Background(), token, "nonce-1"); err != nil {
+		t.Fatalf("throttled stale-key verify: %v", err)
+	}
+	if got := fetches.Load(); got != refreshesBefore {
+		t.Fatalf("healthy fetches changed during outage: %d -> %d", refreshesBefore, got)
+	}
+}
