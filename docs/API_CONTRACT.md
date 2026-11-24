@@ -190,6 +190,13 @@ hanya untuk operasi AI/impor yang memerlukan consent.
 | DELETE | `/v1/admin/users/{id}` | ADMIN | soft delete + revoke |
 | GET | `/v1/admin/audit?target=` | ADMIN | audit admin |
 | POST/GET | `/v1/deletion-requests` | JWT | FR-47/48 |
+| POST | `/v1/gmail/connect/start` | JWT | mulai OAuth Gmail (state sekali pakai) |
+| GET | `/v1/gmail/connect/callback` | — (state) | tukar code → 302 deep link |
+| GET | `/v1/gmail/status` | JWT | status koneksi (email masked) |
+| POST | `/v1/gmail/disconnect` | JWT | stop watch + revoke + hapus kredensial |
+| POST | `/v1/internal/gmail/push` | OIDC Google | terima Pub/Sub push + ACK idempoten |
+| GET | `/v1/retention` | JWT | metadata jendela retensi setahun |
+| POST | `/v1/internal/retention-sweep` | `x-internal-token` | sweep report-only/delete |
 
 `monthId` = `YYYY-MM` Asia/Jakarta.
 
@@ -564,3 +571,53 @@ DDL dan acceptance lokal ada di [`10_MIGRASI_PEDOMAN.md`](10_MIGRASI_PEDOMAN.md)
   1024 input/512 completion tokens, one retry/20s target. Current implementation reserves
   worst-case cost and records attempts; it does not yet implement retry/lease recovery or actual
   token reconciliation.
+
+---
+
+## 18. Gmail API dan Pub/Sub (CR-006)
+
+Kontrak rinci: [`GMAIL_API_CONTRACT.md`](GMAIL_API_CONTRACT.md); panduan Console:
+[`GMAIL_API_SETUP.md`](GMAIL_API_SETUP.md). Ringkas:
+
+- Opt-in `GMAIL_ENABLED` (default `false`); saat nonaktif `connect/start` → `503 gmail_disabled`,
+  callback → `302 pam://gmail/connected?status=error&reason=gmail_disabled`, push → `503`.
+  Status `GET /v1/gmail/status` tetap `200` dengan `connected:false` serta alasan yang aman.
+- `POST /v1/gmail/connect/start` memerlukan sesi JWT aktif dan consent Gmail; hasil
+  `authorization_url` hanya boleh dibuka owner. `state` acak 256-bit, disimpan sebagai hash,
+  sekali pakai, TTL ≤10 menit, terikat owner + PKCE S256.
+- `GET /v1/gmail/connect/callback?code&state` tidak memakai JWT: validasi state → tukar code →
+  verifikasi email akun → simpan refresh token terenkripsi → `users.watch` → jadwalkan backfill.
+  Selalu redirect ke deep link dengan `status=success|error` dan `reason` kode aman
+  (`state_invalid`, `state_expired`, `gmail_disabled`, `consent_required`, …).
+- Satu koneksi ACTIVE per owner; indeks unik parsial. Start saat sudah terhubung → `409`;
+  `reconnect:true` mengganti akun (stop watch + revoke koneksi lama, reset job/event lama).
+- `GET /v1/gmail/status` mengembalikan `connected`, `account_email_masked`, `scope`,
+  `connected_at`, `last_sync_at`, `watch_expires_at`, `sync_state`, `last_error_code`.
+  Token, authorization code, dan email penuh tidak pernah dikembalikan.
+- `POST /v1/internal/gmail/push` diverifikasi JWT OIDC (issuer Google, audience
+  `GMAIL_PUSH_AUDIENCE`, service account `GMAIL_PUSH_SERVICE_ACCOUNT`). Event idempoten
+  (`event_key` unik); ACK `204` setelah event durable, duplikat tidak menambah event, mailbox tak
+  dikenal di-ACK tanpa data.
+- Backfill 12 bulan WIB bergulir, delta via `history.list`, cursor terenkripsi + pemulihan
+  kedaluwarsa, dedupe `g:<hash email>:<messageId>` dan merge dengan identitas IMAP.
+
+## 19. Retensi setahun (CR-005)
+
+Rinci: [`RETENTION_POLICY_IMPLEMENTATION.md`](RETENTION_POLICY_IMPLEMENTATION.md).
+
+- Jendela bergulir satu tahun Asia/Jakarta: mulai hari ini setahun lalu pukul 00:00 WIB, inklusif.
+  Bulan batas parsial dipertahankan barisnya sampai bulan penuh kedaluwarsa. 29 Feb di-clamp ke
+  28 Feb. Month ID selalu WIB.
+- Request baca/tulis di luar jendela → `400 outside_retention`, envelope memuat objek `retention`
+  (`start`, `end`, `monthId`) dan `retryable:false`; kesalahan DB tetap `5xx`. Berlaku untuk
+  transaksi list/create, ringkasan GET/PUT, analisis GET/POST, import job/batch, lampiran, dan
+  filter bulan.
+- `GET /v1/retention` mengembalikan metadata jendela untuk UI.
+- Sweep: `POST /v1/internal/retention-sweep` dengan `x-internal-token` (`INTERNAL_SWEEP_TOKEN`;
+  tanpa token konfigurasi → `404`, salah → `401`). Mode default `report-only` hanya menulis baris
+  audit agregat. Mode `delete` memerlukan `RETENTION_DELETE_ENABLED=true` **dan**
+  `?mode=delete&confirm=RETENTION_DELETE`; bila flag mati → `403 retention_delete_disabled`,
+  tanpa konfirmasi → `400 confirmation_required`. Sweep terjadwal opt-in
+  (`RETENTION_SWEEP_ENABLED`, interval `RETENTION_SWEEP_INTERVAL_HOURS` 1..168, default 24).
+- Budget plan/FR-42 dikecualikan dari sweep dan tetap disimpan. Audit hanya memuat mode, jendela,
+  timestamp, status, dan jumlah agregat — tanpa PII/owner id/token.
