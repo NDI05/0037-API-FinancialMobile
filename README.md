@@ -52,6 +52,21 @@ Untuk UAT, port aktif adalah `18090` (lihat `APP_ENV`, `PORT`).
 
 Health: `GET /healthz` (liveness) dan `GET /readyz` (database siap).
 
+## Google SSO
+
+Login "Masuk dengan Google" memakai Credential Manager di Android; backend memverifikasi ID
+token (RS256, JWKS Google, issuer, audience = Web Client ID, expiry, nonce sekali pakai) lalu
+menerbitkan sesi PAM yang sama seperti login kata sandi. Akun lama menautkan identitas Google
+secara eksplisit (`POST /v1/auth/google/link`); tidak ada pembuatan akun otomatis dan email yang
+sama tidak pernah menggabungkan akun.
+
+- Kontrak: [`docs/GOOGLE_SSO_CONTRACT.md`](docs/GOOGLE_SSO_CONTRACT.md)
+- Env: `GOOGLE_SSO_ENABLED` (default `false`), `GOOGLE_SSO_CLIENT_ID` (Web Client ID, wajib bila
+  aktif), `GOOGLE_SSO_JWKS_URL`, `GOOGLE_SSO_NONCE_TTL_SECONDS` — lihat [`.env.example`](.env.example).
+- Migrasi `021` menambah `google_identities` dan `google_sso_nonces`.
+- UAT akun Google nyata/Gmail live/gate Rp0 **NOT RUN (owner)**; unit/HTTP gate PASS di
+  `integration/2026-11-24` `71013f5`.
+
 ## Gmail API
 
 Sinkronisasi Gmail memakai **Gmail API** (bukan IMAP), scope `gmail.readonly` saja.
