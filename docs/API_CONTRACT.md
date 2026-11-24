@@ -50,10 +50,17 @@ Bulan `YYYY-MM` dalam **Asia/Jakarta**. Nominal selalu **integer minor IDR** (1/
 POST /v1/accounts
 { "email": "a@example.test", "password": "8..200 chars", "displayName": "A", "inviteCode": "..." }
 ```
-`201 { userId, email, displayName, role: "USER" }`. Register publik selalu `USER`. Undangan admin
-memakai `invitationToken` menggantikan `inviteCode` dan boleh menghasilkan `ADMIN` sesuai undangan.
-Duplicate email → `409 conflict`; kode salah → `403 forbidden` (`invalid_invite`).
-Server membuat `account_keys` (kunci fingerprint) dalam transaksi yang sama.
+`inviteCode` **wajib untuk semua registrasi**, termasuk bila body juga membawa `invitationToken`:
+server memeriksa gate `inviteCode` lebih dulu, sebelum memilih jalur undangan. `invitationToken`
+adalah jalur legacy penerimaan undangan admin yang sudah diterbitkan; bila valid (belum dipakai,
+belum kedaluwarsa, email cocok) role diambil dari undangan, bukan dari body, dan bila tidak
+dikirim akun selalu dibuat sebagai `USER`. API pembuatan undangan baru sudah pensiun (404), jadi
+token yang beredar hanyalah undangan lama; keputusan produk OI-28 tetap terbuka (lihat §2.6).
+`201 { userId, email, displayName, role: "USER"|"ADMIN" }`. Duplicate email → `409 conflict`;
+kode undangan kosong/salah → `403 forbidden` (`invalid_invite`, token tidak diproses); token tidak
+valid/email tidak cocok → `400 invalid_invitation`; token terpakai → `409 invitation_used`; token
+kedaluwarsa → `410 invitation_expired`. Server membuat `account_keys` (kunci fingerprint) dalam
+transaksi yang sama.
 
 ### 2.2 Login
 
@@ -118,11 +125,13 @@ ditolak karena sesi dicabut (bukan menunggu TTL).
 CR-008 memensiunkan administrasi pengguna dari cakupan produk. Build target kini hanya punya satu
 peran aplikasi, `USER`; `POST /v1/admin/invitations` dan seluruh `/v1/admin/*` tidak lagi terdaftar
 (404). Penerimaan undangan yang sudah ada tetap dipertahankan: `POST /v1/accounts` masih menerima
-`invitationToken` lama dan role ditentukan oleh token, bukan body. Tidak ada pendaftaran publik role
-tinggi, tidak ada pembuatan undangan baru lewat API, dan tidak ada auto-create akun dari Google SSO.
+`invitationToken` lama **asalkan gate `inviteCode` terpenuhi**, dan role ditentukan oleh token,
+bukan body. Tidak ada pendaftaran publik role tinggi, tidak ada pembuatan undangan baru lewat API,
+dan tidak ada auto-create akun dari Google SSO.
 
 **Dampak OI-28 (terbuka):** jalur pembuatan undangan admin hilang, sehingga akun `ADMIN` baru hanya
-dapat dibuat lewat CLI/ops `pam-admin bootstrap` yang idempoten dan menulis audit. Pedoman akademik
+dapat dibuat lewat CLI/ops `pam-admin -promote <email>` (akun harus sudah terdaftar; CLI idempoten
+dan menulis audit). Pedoman akademik
 D.2 (peran) perlu dipetakan ulang ke satu peran + isolasi data; keputusan produk lanjutan menunggu
 pemilik dan tidak mengubah kontrak onboarding saat ini.
 
