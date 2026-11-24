@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/llm"
-	"github.com/pam/recap/backend-go/internal/store"
 )
 
 // retentionTestNow is a fixed wall clock so period boundaries are deterministic in HTTP tests.
@@ -232,108 +231,6 @@ func retentionRowExists(t *testing.T, h *harness, query string) bool {
 
 // Expired attachment metadata must not stay readable through direct by-id paths, and listings
 // without a transaction filter clamp those rows out while keeping in-window rows visible.
-func TestRetentionGuardsCoverDerivativeAttachmentPaths(t *testing.T) {
-	h := newHarness(t)
-	pinRetentionClock(h)
-	h.register("retention-attachment@example.test")
-	token, _ := h.login("retention-attachment@example.test")
-	grantRetentionConsent(t, h, token, "GMAIL_READ")
-	ownerID := ownerIDForEmail(t, h, "retention-attachment@example.test")
-
-	insertExpiredTransaction(t, h, ownerID, "tx_expired_att", retentionTestNow.AddDate(-1, -2, 0))
-	expiredAttachment, err := h.store.CreateAttachment(context.Background(), ownerID, store.AttachmentInput{
-		TransactionID: "tx_expired_att", FileName: "lama.pdf", Mime: "application/pdf",
-		SizeBytes: 12, Sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		StorageRef: "attachments/2024/01/lama.pdf",
-	}, retentionTestNow)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// In-window attachment through the public API for the listing contrast.
-	status, body := h.request("POST", "/v1/transactions", token, map[string]any{
-		"direction": "DEBIT", "amountMinor": 1000, "currency": "IDR",
-		"eventAt": "2026-11-18T04:00:00Z",
-	})
-	if status != 201 {
-		t.Fatalf("create transaction = %d %#v", status, body)
-	}
-	txID := body["id"].(string)
-	status, created := h.request("POST", "/v1/attachments", token, map[string]any{
-		"transactionId": body["id"], "fileName": "baru.pdf", "mimeType": "application/pdf",
-		"sizeBytes": 10, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		"storageRef": "attachments/2026/11/baru.pdf",
-	})
-	if status != 201 {
-		t.Fatalf("create attachment = %d %#v", status, created)
-	}
-	knownAttachment := created["id"].(string)
-
-	for _, request := range []struct{ method, path string }{
-		{"GET", "/v1/attachments/" + expiredAttachment.ID},
-		{"PATCH", "/v1/attachments/" + expiredAttachment.ID},
-		{"DELETE", "/v1/attachments/" + expiredAttachment.ID},
-	} {
-		var payload map[string]any
-		if request.method == "PATCH" {
-			payload = map[string]any{"fileName": "x.pdf", "revision": 0}
-		}
-		status, body := h.request(request.method, request.path, token, payload)
-		if status != 400 || body["code"] != "outside_retention" {
-			t.Fatalf("%s %s = %d %#v, want 400 outside_retention", request.method, request.path, status, body)
-		}
-	}
-	if status, body := h.request("GET", "/v1/attachments/"+knownAttachment, token, nil); status != 200 {
-		t.Fatalf("in-window attachment = %d %#v", status, body)
-	}
-	if status, body := h.request("GET", "/v1/attachments?transactionId="+txID, token, nil); status != 200 {
-		t.Fatalf("in-window filtered list = %d %#v", status, body)
-	}
-	// In-window mutation/deletion must still work: the guard only blocks expired period data.
-	status, body = h.request("PATCH", "/v1/attachments/"+knownAttachment, token, map[string]any{
-		"fileName": "baru-diubah.pdf", "revision": 0,
-	})
-	if status != 200 {
-		t.Fatalf("in-window attachment patch = %d %#v", status, body)
-	}
-	status, createdDelete := h.request("POST", "/v1/attachments", token, map[string]any{
-		"transactionId": txID, "fileName": "hapus.pdf", "mimeType": "application/pdf",
-		"sizeBytes": 11, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		"storageRef": "attachments/2026/11/hapus.pdf",
-	})
-	if status != 201 {
-		t.Fatalf("create attachment to delete = %d %#v", status, createdDelete)
-	}
-	status, body = h.request("DELETE", "/v1/attachments/"+createdDelete["id"].(string)+"?revision=0", token, nil)
-	if status != 204 {
-		t.Fatalf("in-window attachment delete = %d %#v", status, body)
-	}
-
-	status, list := h.request("GET", "/v1/attachments", token, nil)
-	if status != 200 {
-		t.Fatalf("list attachments = %d %#v", status, list)
-	}
-	items, _ := list["items"].([]any)
-	if len(items) != 1 {
-		t.Fatalf("unfiltered list = %#v, want only the in-window row", list)
-	}
-	if got := items[0].(map[string]any)["id"]; got != knownAttachment {
-		t.Fatalf("unfiltered list kept %v, want %s", got, knownAttachment)
-	}
-
-	// A linked transaction that is already soft-deleted means the metadata has no live period
-	// owner; by-id access must be 404 rather than an internal error or a stale 200.
-	if _, err := h.store.DB.ExecContext(context.Background(),
-		`UPDATE transactions SET deleted_at = ? WHERE id = ?`,
-		retentionTestNow.UTC().Format(time.RFC3339Nano), txID); err != nil {
-		t.Fatal(err)
-	}
-	if status, body := h.request("GET", "/v1/attachments/"+knownAttachment, token, nil); status != 404 {
-		t.Fatalf("attachment of soft-deleted transaction = %d %#v, want 404", status, body)
-	}
-
-}
-
 // Import job metadata is period data: reading a job whose month left the window is a 4xx policy
 // error, not a successful 200 with stale metadata.
 func TestRetentionGuardCoversImportJobRead(t *testing.T) {

@@ -268,29 +268,11 @@ func TestRefreshRotationReplayAndConcurrentUse(t *testing.T) {
 	}
 }
 
-func TestBudgetCRUDAndCategoryReassign(t *testing.T) {
+func TestCategoryReassignAfterUse(t *testing.T) {
 	h := newHarness(t)
-	h.register("budget@example.test")
-	token, _ := h.login("budget@example.test")
-	food := h.category(token, "food")
+	h.register("reassign@example.test")
+	token, _ := h.login("reassign@example.test")
 	other := h.category(token, "transport")
-
-	status, plan := h.request("PUT", "/v1/budget-plans/2026-12", token, map[string]any{
-		"expectedIncomeMinor": 500_000_000, "plannedSavingsMinor": 100_000_000,
-		"limits":     []map[string]any{{"categoryId": food, "amountMinor": 90_000_000}},
-		"attributes": map[string]any{"catatan": "desember"},
-	})
-	if status != 200 || plan["gapMinor"].(float64) != 310_000_000 {
-		t.Fatalf("budget put: %d %#v", status, plan)
-	}
-	status, plan = h.request("PUT", "/v1/budget-plans/2026-12", token, map[string]any{
-		"expectedIncomeMinor": 500_000_000, "plannedSavingsMinor": 100_000_000,
-		"limits":   []map[string]any{{"categoryId": food, "amountMinor": 50_000_000}},
-		"revision": 0,
-	})
-	if status != 200 || plan["gapMinor"].(float64) != 350_000_000 {
-		t.Fatalf("budget update: %d %#v", status, plan)
-	}
 
 	// A used category needs an explicit reassignment.
 	status, created := h.request("POST", "/v1/categories", token, map[string]any{
@@ -576,7 +558,7 @@ func (p *blockingProvider) Analyze(ctx context.Context, payload map[string]any) 
 }
 
 func TestAnalysisRaceWithConsentAndDeletion(t *testing.T) {
-	for _, action := range []string{"withdraw", "delete", "mutate", "prior", "budget", "category", "coverage"} {
+	for _, action := range []string{"withdraw", "delete", "mutate", "prior", "category", "coverage"} {
 		t.Run(action, func(t *testing.T) {
 			provider := &blockingProvider{entered: make(chan struct{}), release: make(chan struct{})}
 			h := newHarnessWithProvider(t, provider)
@@ -632,13 +614,6 @@ func TestAnalysisRaceWithConsentAndDeletion(t *testing.T) {
 					"eventAt": "2026-10-20T04:10:00Z", "categoryId": food,
 				}); status != 201 {
 					t.Fatalf("prior mutation: %d", status)
-				}
-			case "budget":
-				if status, _ := h.request("PUT", "/v1/budget-plans/2026-11", token, map[string]any{
-					"expectedIncomeMinor": 1_000_000, "plannedSavingsMinor": 100_000,
-					"limits": []any{}, "revision": 0,
-				}); status != 200 {
-					t.Fatalf("budget mutation: %d", status)
 				}
 			case "category":
 				if status, _ := h.request("PATCH", "/v1/categories/"+food, token, map[string]any{
@@ -1392,11 +1367,6 @@ func TestAnalysisFreshnessOnReadReplayAndDependencies(t *testing.T) {
 			h.request("POST", "/v1/transactions", token, map[string]any{
 				"direction": "DEBIT", "amountMinor": 3_000, "currency": "IDR",
 				"eventAt": "2026-10-20T04:10:00Z", "categoryId": food})
-		}},
-		{"budget", func() {
-			h.request("PUT", "/v1/budget-plans/2026-11", token, map[string]any{
-				"expectedIncomeMinor": 1_000_000, "plannedSavingsMinor": 0,
-				"limits": []any{}, "revision": 0})
 		}},
 		{"category", func() {
 			h.request("PATCH", "/v1/categories/"+food, token, map[string]any{

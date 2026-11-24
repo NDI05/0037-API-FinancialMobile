@@ -37,10 +37,10 @@ fully outside the window or starts in the future:
 - `POST /v1/import-jobs` (job month) and `POST /v1/import-jobs/{id}/batches` (job month and each
   `PARSED` candidate's `eventAt`)
 - `POST /v1/transactions` when `eventAt` is older than the window (import/backfill is bounded)
-- `GET /v1/attachments?transactionId=...`, `POST /v1/attachments`, and
-  `GET|PATCH|DELETE /v1/attachments/{id}` for metadata tied to an expired transaction
-- `GET /v1/attachments` without a transaction filter clamps expired metadata out of the page
-  (the cursor is preserved so paging still advances)
+- Lampiran transaksi (`/v1/attachments*`) **dipensiunkan CR-008**: route tidak terdaftar dan
+  menjawab `404`, sehingga guard HTTP untuk metadata lampiran tidak lagi berlaku. Baris
+  `attachments` lama tetap disimpan tanpa dihapus; guard retensi untuk data transaksi turunannya
+  tetap berlaku di jalur yang masih aktif.
 - `GET /v1/import-jobs/{id}` when the job's month is outside the window
 
 The error uses the standard envelope with `retryable:false` and an extra `retention` object

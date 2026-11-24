@@ -113,12 +113,18 @@ ditolak karena sesi dicabut (bukan menunggu TTL).
   yang belum terkirim bila aman, dan masuk ke layar pemulihan sesi (FR-62).
 - Access/refresh disimpan dengan Keystore; `Authorization` tidak pernah dicatat.
 
-### 2.6 Provisioning admin
+### 2.6 Provisioning admin dan OI-28 (CR-008)
 
-Tidak ada endpoint publik yang menaikkan role. Dua jalur terkontrol:
-- CLI/ops `npm run provision:admin -- --email <email>` (idempoten, menulis audit); atau
-- `POST /v1/admin/invitations` oleh ADMIN, token satu-kali ditampilkan **sekali** untuk dibagikan
-  pemilik. Tidak ada pengiriman email otomatis.
+CR-008 memensiunkan administrasi pengguna dari cakupan produk. Build target kini hanya punya satu
+peran aplikasi, `USER`; `POST /v1/admin/invitations` dan seluruh `/v1/admin/*` tidak lagi terdaftar
+(404). Penerimaan undangan yang sudah ada tetap dipertahankan: `POST /v1/accounts` masih menerima
+`invitationToken` lama dan role ditentukan oleh token, bukan body. Tidak ada pendaftaran publik role
+tinggi, tidak ada pembuatan undangan baru lewat API, dan tidak ada auto-create akun dari Google SSO.
+
+**Dampak OI-28 (terbuka):** jalur pembuatan undangan admin hilang, sehingga akun `ADMIN` baru hanya
+dapat dibuat lewat CLI/ops `pam-admin bootstrap` yang idempoten dan menulis audit. Pedoman akademik
+D.2 (peran) perlu dipetakan ulang ke satu peran + isolasi data; keputusan produk lanjutan menunggu
+pemilik dan tidak mengubah kontrak onboarding saat ini.
 
 ---
 
@@ -170,10 +176,6 @@ hanya untuk operasi AI/impor yang memerlukan consent.
 | GET | `/v1/categories/{id}` | JWT | detail |
 | PATCH | `/v1/categories/{id}` | JWT | label/warna/atribut |
 | DELETE | `/v1/categories/{id}?reassignTo=` | JWT | reassign + soft delete |
-| GET | `/v1/budget-plans?from=&to=` | JWT | list bulan |
-| GET | `/v1/budget-plans/{monthId}` | JWT | detail |
-| PUT | `/v1/budget-plans/{monthId}` | JWT | upsert + `If-Match` |
-| DELETE | `/v1/budget-plans/{monthId}` | JWT | hard delete |
 | POST | `/v1/import-jobs` | JWT | buat job |
 | GET | `/v1/import-jobs/{id}` | JWT | status job |
 | POST | `/v1/import-jobs/{id}/batches` | JWT | batch atomik/idempoten |
@@ -181,14 +183,6 @@ hanya untuk operasi AI/impor yang memerlukan consent.
 | GET | `/v1/summaries/{monthId}` | JWT | ringkasan server-side |
 | POST | `/v1/analyses` | JWT | FR-34…41/50 |
 | GET | `/v1/analyses/{monthId}` | JWT | analisis tersimpan |
-| GET/POST | `/v1/attachments` | JWT | list metadata / create metadata |
-| PATCH/DELETE | `/v1/attachments/{id}` | JWT | rename/atribut / soft delete |
-| GET | `/v1/admin/users` | ADMIN | list/search |
-| GET | `/v1/admin/users/{id}` | ADMIN | detail akun |
-| POST | `/v1/admin/invitations` | ADMIN | invite/create |
-| PATCH | `/v1/admin/users/{id}` | ADMIN | nama/role/status + `If-Match` |
-| DELETE | `/v1/admin/users/{id}` | ADMIN | soft delete + revoke |
-| GET | `/v1/admin/audit?target=` | ADMIN | audit admin |
 | POST/GET | `/v1/deletion-requests` | JWT | FR-47/48 |
 | POST | `/v1/gmail/connect/start` | JWT | mulai OAuth Gmail (state sekali pakai) |
 | GET | `/v1/gmail/connect/callback` | — (state) | tukar code → 302 deep link |
@@ -384,67 +378,15 @@ yang dihitung ulang, bukan otomatis `AVAILABLE/CURRENT`.
 
 ---
 
-## 9. Anggaran
+## 9. Anggaran, lampiran dan admin (dipensiunkan CR-008)
 
-`GET /v1/budget-plans/{monthId}` → `{ monthId, expectedIncomeMinor, plannedSavingsMinor,
-limits:[{categoryId,amountMinor}], attributes, revision, gapMinor }` (`gap = income − savings −
-Σlimits`, integer minor).
-
-`PUT /v1/budget-plans/{monthId}` + `If-Match` (`0` untuk create):
-```json
-{ "expectedIncomeMinor": 500000000, "plannedSavingsMinor": 100000000,
-  "limits": [{ "categoryId": "cat_food", "amountMinor": 90000000 }],
-  "attributes": { "catatan": "..." } }
-```
-Satu transaksi: upsert `budget_plans` (integer minor + sealed attributes), ganti seluruh
-`budget_limits` (validasi kategori owner/aktif), naikkan `revision`. `DELETE` menghapus plan+limits
-(hard) dan menulis audit; tidak mengubah total arus kas.
-
----
-
-## 10. Lampiran metadata
-
-Urutan klien: pilih file → salin ke direktori privat owner → `POST /v1/attachments` metadata. Bila
-POST gagal, file hasil salin dihapus atau masuk retry queue.
-
-`POST`:
-```json
-{ "transactionId": "tx_...", "localFileId": "lf_...", "deviceRef": "dev_...",
-  "displayName": "nota.pdf", "mime": "application/pdf", "sizeBytes": 123456,
-  "attributes": { "jenis": "nota" } }
-```
-`201 { id, revision, transactionId, localFileId, mime, sizeBytes, createdAt }`.
-`(owner, transactionId, localFileId)` idempoten. Batas: 10 MB, MIME `image/jpeg|image/png|
-image/webp|application/pdf`, ≤10 lampiran/transaksi, nama ≤120 char, atribut ≤2 KB JSON.
-
-`GET ?transactionId=&q=&cursor=`; `PATCH {displayName?, attributes?}` + `If-Match`;
-`DELETE` soft-delete metadata. Klien menghapus file lokal setelah server mengonfirmasi tombstone;
-bila hapus file gagal, tombstone + retry queue mencegah metadata menggantung. Di perangkat lain,
-metadata tampil dengan `fileAvailable=false` karena `deviceRef` berbeda. Menghapus transaksi
-men-cascade soft-delete metadata; file lokal dibersihkan oleh klien.
-
-Server **tidak** menyimpan/mengirim isi file dan tidak menyediakan download.
-
----
-
-## 11. Admin
-
-`GET /v1/admin/users?q=&role=&status=&cursor=&limit=` — default mengecualikan `DELETED`; email
-boleh terlihat oleh ADMIN.
-
-`POST /v1/admin/invitations { email, role: "USER"|"ADMIN" }` → `201
-{ id, email, role, expiresAt, token }`; `token` ditampilkan sekali dan disimpan hanya hash-nya.
-Undangan terikat email + role, sekali pakai, kedaluwarsa 7 hari.
-
-`PATCH /v1/admin/users/{id}` + `If-Match: "<revision>"` body `{displayName?, role?, status?}`.
-- Role/status berubah → naikkan `users.auth_version`, revoke semua sesi/refresh, tulis
-  `admin_audit`, dalam satu transaksi.
-- Menurunkan/menghapus ADMIN aktif terakhir → `409 last_admin` (juga dijaga trigger DB).
-- ADMIN tidak boleh menaikkan dirinya sendiri lewat endpoint profil biasa.
-
-`DELETE /v1/admin/users/{id}` = soft delete (`status=DELETED`), revoke sesi, audit. Data keuangan
-tetap disimpan sampai retensi/penghapusan akun; tidak muncul di daftar aktif atau total pengguna.
-Admin aktif terakhir tidak dapat dihapus.
+Modul anggaran, lampiran transaksi, dan administrasi pengguna dikeluarkan dari cakupan produk
+(CR-008). Dokumen ini tidak lagi mendefinisikan kontrak HTTP untuk ketiganya; route dihapus dari
+mux dan permintaan apa pun mendapat `404`. Data lama dipertahankan di tabel `budget_plans`,
+`budget_limits`, `attachments`, `admin_invitations`, dan `admin_audit` tanpa perubahan skema, sehingga
+penghapusan data tidak pernah menjadi efek samping dari perubahan cakupan. Analisis keuangan dan
+ringkasan tidak lagi memakai anggaran sebagai dependensi yang dapat diubah pengguna; dependensi
+historis yang tersimpan tetap dihitung dari baris lama bila ada.
 
 ---
 
@@ -513,11 +455,11 @@ email, nominal, merchant, token, ciphertext atau path file. `ownerRef` = hash pe
 | `auth_sessions`, `refresh_tokens` | sesi JWT + rotasi refresh |
 | `account_keys` | kunci fingerprint tersegel |
 | `categories`, `transactions` | CRUDS owner-scoped + field dinamis |
-| `budget_plans`, `budget_limits` | rencana + batas kategori |
-| `attachments` | metadata lampiran (bukan file) |
+| `budget_plans`, `budget_limits` | **legacy CR-008**: data dipertahankan, tanpa API |
+| `attachments` | **legacy CR-008**: metadata dipertahankan, tanpa API |
 | `import_jobs`, `import_batches`, `import_skipped` | impor atomik/idempoten |
 | `month_revisions` | revisi dependen |
-| `admin_invitations`, `admin_audit` | provisioning/jejak admin |
+| `admin_invitations`, `admin_audit` | **legacy CR-008**: data dipertahankan, tanpa API |
 | `consents`, `summaries`, `analyses`, `deletion_requests`, `usage_counters` | existing |
 
 DDL dan acceptance lokal ada di [`10_MIGRASI_PEDOMAN.md`](10_MIGRASI_PEDOMAN.md). Migrasi cloud
@@ -532,10 +474,9 @@ DDL dan acceptance lokal ada di [`10_MIGRASI_PEDOMAN.md`](10_MIGRASI_PEDOMAN.md)
 3. CRUDS transaksi/kategori: `If-Match`, soft delete, reassign kategori, total berubah.
 4. Impor: batch idempoten, retry tidak menduplikasi, atomic rollback, revisi naik sekali.
 5. Ringkasan: angka cocok dengan calculator, `inputRevision` berubah setelah edit/hapus.
-6. Anggaran: limits menggantikan seluruh set, gap benar, delete tidak mengubah cashflow.
-7. Lampiran: metadata tanpa file di perangkat lain, cleanup/retry, delete transaksi.
-8. Admin: invite/create, role/status, last-admin, revoke sesi, audit.
-9. Shadow search: hanya rentang terbatas, pagination benar, ciphertext tidak di-`LIKE`.
+6. Modul pensiun CR-008: semua method `/v1/budget-plans*`, `/v1/attachments*`, `/v1/admin/*` → 404;
+   tabel dan baris lama tetap ada; registrasi dengan `invitationToken` lama tetap berfungsi.
+7. Shadow search: hanya rentang terbatas, pagination benar, ciphertext tidak di-`LIKE`.
 10. Log/scan: tanpa PII; database cloud diuji terpisah dengan kredensial uji.
 
 ---

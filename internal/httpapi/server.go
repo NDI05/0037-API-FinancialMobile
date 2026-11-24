@@ -92,17 +92,6 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/consents", s.authed(s.appendConsent))
 	mux.Handle("GET /v1/categories", s.authed(s.listCategories))
 	mux.Handle("POST /v1/categories", s.authed(s.createCategory))
-	mux.Handle("POST /v1/admin/invitations", s.authed(requiresAdmin(s.createAdminInvitation)))
-	mux.Handle("GET /v1/admin/accounts", s.authed(requiresAdmin(s.listAdminAccounts)))
-	mux.Handle("GET /v1/admin/accounts/{ownerID}", s.authed(requiresAdmin(s.getAdminAccount)))
-	mux.Handle("PATCH /v1/admin/accounts/{ownerID}", s.authed(requiresAdmin(s.updateAdminAccount)))
-	mux.Handle("DELETE /v1/admin/accounts/{ownerID}", s.authed(requiresAdmin(s.deactivateAdminAccount)))
-	mux.Handle("GET /v1/admin/audit", s.authed(requiresAdmin(s.listAudit)))
-	mux.Handle("GET /v1/attachments", s.authed(s.listAttachments))
-	mux.Handle("POST /v1/attachments", s.authed(s.createAttachment))
-	mux.Handle("GET /v1/attachments/{id}", s.authed(s.getAttachment))
-	mux.Handle("PATCH /v1/attachments/{id}", s.authed(s.updateAttachment))
-	mux.Handle("DELETE /v1/attachments/{id}", s.authed(s.deleteAttachment))
 	mux.Handle("GET /v1/categories/{id}", s.authed(s.getCategory))
 	mux.Handle("PATCH /v1/categories/{id}", s.authed(s.updateCategory))
 	mux.Handle("DELETE /v1/categories/{id}", s.authed(s.deleteCategory))
@@ -113,10 +102,6 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /v1/transactions/{id}", s.authed(s.deleteTransaction))
 	mux.Handle("PUT /v1/summaries/{monthID}", s.authed(s.putSummary))
 	mux.Handle("GET /v1/summaries/{monthID}", s.authed(s.getSummary))
-	mux.Handle("GET /v1/budget-plans", s.authed(s.listBudgets))
-	mux.Handle("GET /v1/budget-plans/{monthID}", s.authed(s.getBudget))
-	mux.Handle("PUT /v1/budget-plans/{monthID}", s.authed(s.putBudget))
-	mux.Handle("DELETE /v1/budget-plans/{monthID}", s.authed(s.deleteBudget))
 	mux.Handle("POST /v1/import-jobs", s.authed(s.createImportJob))
 	mux.Handle("GET /v1/import-jobs/{id}", s.authed(s.getImportJob))
 	mux.Handle("POST /v1/import-jobs/{id}/batches", s.authed(s.importBatch))
@@ -309,17 +294,6 @@ func (s *Server) authenticate(next http.HandlerFunc, allowInactive bool) http.Ha
 		info := authInfo{OwnerID: claims.Subject, SessionID: claims.SID, Role: state.Role}
 		next(w, r.WithContext(context.WithValue(r.Context(), authContextKey, info)))
 	})
-}
-
-func requiresAdmin(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		info, ok := authFrom(r)
-		if !ok || info.Role != "ADMIN" {
-			writeError(w, http.StatusForbidden, "forbidden", "Admin role required", correlationOf(r))
-			return
-		}
-		next(w, r)
-	}
 }
 
 func authFrom(r *http.Request) (authInfo, bool) {
