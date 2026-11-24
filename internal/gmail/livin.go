@@ -29,7 +29,7 @@ type ParsedNotification struct {
 }
 
 // TemplateVersion identifies the parser generation stored with imported rows.
-const TemplateVersion = "gmail-livin-v1"
+const TemplateVersion = "gmail-livin-v2"
 
 var (
 	jakarta = mustLoadJakarta()
