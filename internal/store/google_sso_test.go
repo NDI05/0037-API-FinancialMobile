@@ -213,3 +213,83 @@ func TestConcurrentGoogleLinkHasExactlyOneWinner(t *testing.T) {
 		t.Fatalf("winner owner = %q", identity.OwnerID)
 	}
 }
+
+func TestGoogleLinkUniqueViolationClassification(t *testing.T) {
+	cases := []struct {
+		name                    string
+		message                 string
+		ownerConflict, identity bool
+	}{
+		{"owner unique", "UNIQUE constraint failed: google_identities.owner_id", true, false},
+		{"identity pk", "UNIQUE constraint failed: google_identities.issuer, google_identities.subject",
+			false, true},
+		{"libsql owner", "constraint failed: UNIQUE constraint failed: google_identities.owner_id (1555)",
+			true, false},
+		{"non-unique", "constraint failed: FOREIGN KEY constraint failed (787)", false, false},
+		{"unique without columns", "UNIQUE constraint failed", false, false},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			ownerConflict, identityConflict := googleLinkUniqueViolation(test.message)
+			if ownerConflict != test.ownerConflict || identityConflict != test.identity {
+				t.Fatalf("classification = (%v,%v), want (%v,%v)", ownerConflict, identityConflict,
+					test.ownerConflict, test.identity)
+			}
+		})
+	}
+}
+
+// TestConcurrentGoogleLinkSameOwnerDifferentSubjects is the P2 regression: two simultaneous links
+// for one owner with different Google identities used to surface a 500 because the UNIQUE(owner_id)
+// failure was mistaken for an unknown identity. Exactly one insert must win and the loser must be a
+// clean ErrGoogleAlreadyLinked, with one row and no partial write.
+func TestConcurrentGoogleLinkSameOwnerDifferentSubjects(t *testing.T) {
+	store, ctx := newSSOStore(t)
+	now := time.Now().UTC()
+	digest := PasswordDigest{Salt: []byte("salt"), Hash: []byte("hash"), KDF: "scrypt:N=32768,r=8,p=1"}
+	account, err := store.CreateAccount(ctx, "owner@example.test", "Owner", digest, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make([]error, 2)
+	var wg sync.WaitGroup
+	for index, subject := range []string{"concurrent-sub-a", "concurrent-sub-b"} {
+		wg.Add(1)
+		go func(index int, subject string) {
+			defer wg.Done()
+			<-start
+			results[index] = store.LinkGoogleIdentity(ctx, account.OwnerID,
+				"https://accounts.google.com", subject, "owner@example.test", now)
+		}(index, subject)
+	}
+	close(start)
+	wg.Wait()
+	winners, alreadyLinked := 0, 0
+	for _, result := range results {
+		switch {
+		case result == nil:
+			winners++
+		case errors.Is(result, ErrGoogleAlreadyLinked):
+			alreadyLinked++
+		default:
+			t.Fatalf("concurrent link error = %v", result)
+		}
+	}
+	if winners != 1 || alreadyLinked != 1 {
+		t.Fatalf("winners=%d alreadyLinked=%d results=%v", winners, alreadyLinked, results)
+	}
+	var count int
+	if err := store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM google_identities
+		WHERE owner_id = ?`, account.OwnerID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("identity rows = %d, want 1", count)
+	}
+	// A later sequential attempt with yet another subject is still already_linked, not conflict.
+	if err := store.LinkGoogleIdentity(ctx, account.OwnerID, "https://accounts.google.com",
+		"concurrent-sub-c", "owner@example.test", now); !errors.Is(err, ErrGoogleAlreadyLinked) {
+		t.Fatalf("third identity link error = %v, want ErrGoogleAlreadyLinked", err)
+	}
+}

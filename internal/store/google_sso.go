@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -121,22 +122,45 @@ func (s *Store) LinkGoogleIdentity(ctx context.Context, ownerID, issuer, subject
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		issuer, subject, ownerID, nullString(email), nowString(now), nowString(now))
 	if err != nil {
-		if !isUnique(err.Error()) {
+		ownerConflict, identityConflict := googleLinkUniqueViolation(err.Error())
+		if !ownerConflict && !identityConflict {
 			return err
 		}
 		// The transaction is aborted after a constraint failure on some engines; resolve the
 		// loser from the committed winner instead of returning a 500.
 		_ = tx.Rollback()
 		existing, findErr := s.FindGoogleIdentity(ctx, issuer, subject)
-		if findErr != nil {
-			return findErr
-		}
-		if existing.OwnerID == ownerID {
+		if findErr == nil && existing.OwnerID == ownerID {
 			return nil // concurrent duplicate of the same idempotent link
 		}
-		return ErrGoogleIdentityConflict
+		if findErr != nil && !errors.Is(findErr, ErrGoogleIdentityNotLinked) {
+			return findErr
+		}
+		// The PK conflict is checked first: if this identity belongs to another owner, that is the
+		// more specific conflict even when our owner also raced a different identity in.
+		if identityConflict {
+			return ErrGoogleIdentityConflict
+		}
+		return ErrGoogleAlreadyLinked
 	}
 	return tx.Commit()
+}
+
+// googleLinkUniqueViolation classifies a link INSERT failure by the column named in the engine
+// error. Both SQLite and libSQL name the offending columns, e.g.
+// "UNIQUE constraint failed: google_identities.owner_id" for a second identity on one owner, or
+// "UNIQUE constraint failed: google_identities.issuer, google_identities.subject" for a claimed
+// identity. Matching the column avoids reporting the owner race as ErrGoogleIdentityNotLinked,
+// which used to surface as a 500. When an engine omits the columns the error is not classified and
+// returned to the caller unchanged.
+func googleLinkUniqueViolation(errorString string) (ownerConflict, identityConflict bool) {
+	if !isUnique(errorString) {
+		return false, false
+	}
+	lower := strings.ToLower(errorString)
+	return strings.Contains(lower, "google_identities.owner_id"),
+		strings.Contains(lower, "google_identities.issuer") ||
+			strings.Contains(lower, "google_identities.subject")
 }
 
 // TouchGoogleIdentity records a successful SSO login. It is best-effort bookkeeping; the caller

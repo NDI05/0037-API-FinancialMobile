@@ -379,3 +379,131 @@ func TestConcurrentGoogleLinkHasExactlyOneWinner(t *testing.T) {
 		t.Fatal("identity missing after concurrent link")
 	}
 }
+
+func (h *googleHarness) countRows(t *testing.T, table, ownerID string) int {
+	t.Helper()
+	var count int
+	if err := h.store.DB.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE owner_id = ?`,
+		ownerID).Scan(&count); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return count
+}
+
+// TestConcurrentGoogleLinkSameOwnerDifferentSubjectsHTTP is the audit P2-1 regression. Both orders
+// must be deterministic: if the requests race, the loser hits UNIQUE(owner_id) and must map to
+// 409 google_already_linked; if the server serializes them, the pre-check returns the same code.
+// Neither order may produce 500 or a second identity row.
+func TestConcurrentGoogleLinkSameOwnerDifferentSubjectsHTTP(t *testing.T) {
+	h := newGoogleHarness(t)
+	h.register("race-owner@example.test")
+	access, _ := h.login("race-owner@example.test")
+	owner := store.OwnerIDForEmail("race-owner@example.test")
+
+	// Link must not touch account data: seed one transaction and assert both tables are unchanged.
+	food := h.category(access, "food")
+	if status, body := h.request("POST", "/v1/transactions", access, map[string]any{
+		"direction": "DEBIT", "amountMinor": 17_500_000, "currency": "IDR",
+		"eventAt": "2026-11-19T04:10:00Z", "categoryId": food,
+	}); status != 201 {
+		t.Fatalf("seed transaction = %d %#v", status, body)
+	}
+	transactionsBefore := h.countRows(t, "transactions", owner)
+	gmailBefore := h.countRows(t, "gmail_connections", owner)
+
+	nonceA, nonceB := h.nonce(t), h.nonce(t)
+	tokenA := h.tokenFor(t, "owner-race-sub-a", nonceA, nil)
+	tokenB := h.tokenFor(t, "owner-race-sub-b", nonceB, nil)
+	barrier := make(chan struct{})
+	statuses := make([]int, 2)
+	bodies := make([]map[string]any, 2)
+	var wg sync.WaitGroup
+	for index, request := range []struct{ token, nonce string }{
+		{tokenA, nonceA}, {tokenB, nonceB},
+	} {
+		wg.Add(1)
+		go func(index int, token, nonce string) {
+			defer wg.Done()
+			<-barrier
+			statuses[index], bodies[index] = h.link(t, access, token, nonce)
+		}(index, request.token, request.nonce)
+	}
+	close(barrier)
+	wg.Wait()
+
+	wins, alreadyLinked, other := 0, 0, 0
+	for index, status := range statuses {
+		switch {
+		case status == 200:
+			wins++
+		case status == 409 && bodies[index]["code"] == "google_already_linked":
+			alreadyLinked++
+		default:
+			other++
+			t.Errorf("unexpected status/body: %d %#v", status, bodies[index])
+		}
+	}
+	if wins != 1 || alreadyLinked != 1 || other != 0 {
+		t.Fatalf("statuses=%v bodies=%#v, want exactly one 200 and one 409 already_linked",
+			statuses, bodies)
+	}
+	if rows := h.countRows(t, "google_identities", owner); rows != 1 {
+		t.Fatalf("identity rows = %d, want 1", rows)
+	}
+	if after := h.countRows(t, "transactions", owner); after != transactionsBefore {
+		t.Fatalf("transactions changed by link: %d -> %d", transactionsBefore, after)
+	}
+	if after := h.countRows(t, "gmail_connections", owner); after != gmailBefore {
+		t.Fatalf("gmail connections changed by link: %d -> %d", gmailBefore, after)
+	}
+	// Sequential retry with a third identity is already_linked too, never a 500.
+	nonce := h.nonce(t)
+	status, body := h.link(t, access, h.tokenFor(t, "owner-race-sub-c", nonce, nil), nonce)
+	if status != 409 || body["code"] != "google_already_linked" {
+		t.Fatalf("sequential third link = %d %#v", status, body)
+	}
+}
+
+// TestGoogleSSOSameEmailDifferentSubjectsDoNotMerge proves the email claim is informational only:
+// two owners may have Google identities with the same verified email but different subjects, and
+// each subject keeps logging into its own PAM account.
+func TestGoogleSSOSameEmailDifferentSubjectsDoNotMerge(t *testing.T) {
+	h := newGoogleHarness(t)
+	h.register("first@example.test")
+	h.register("second@example.test")
+	firstAccess, _ := h.login("first@example.test")
+	secondAccess, _ := h.login("second@example.test")
+	firstOwner := store.OwnerIDForEmail("first@example.test")
+	secondOwner := store.OwnerIDForEmail("second@example.test")
+
+	sameEmail := "shared-claim@example.test"
+	nonce := h.nonce(t)
+	if status, body := h.link(t, firstAccess, h.tokenFor(t, "email-sub-first", nonce,
+		func(claims map[string]any) { claims["email"] = sameEmail }), nonce); status != 200 {
+		t.Fatalf("first link = %d %#v", status, body)
+	}
+	nonce = h.nonce(t)
+	if status, body := h.link(t, secondAccess, h.tokenFor(t, "email-sub-second", nonce,
+		func(claims map[string]any) { claims["email"] = sameEmail }), nonce); status != 200 {
+		t.Fatalf("second link = %d %#v", status, body)
+	}
+	if rows := h.countRows(t, "google_identities", firstOwner); rows != 1 {
+		t.Fatalf("first owner rows = %d", rows)
+	}
+	if rows := h.countRows(t, "google_identities", secondOwner); rows != 1 {
+		t.Fatalf("second owner rows = %d", rows)
+	}
+	for subject, wantOwner := range map[string]string{
+		"email-sub-first": firstOwner, "email-sub-second": secondOwner,
+	} {
+		nonce = h.nonce(t)
+		status, session := h.googleLogin(t, h.tokenFor(t, subject, nonce, nil), nonce)
+		if status != 200 {
+			t.Fatalf("%s login = %d %#v", subject, status, session)
+		}
+		user := session["user"].(map[string]any)
+		if user["ownerId"] != wantOwner {
+			t.Fatalf("%s owner = %v, want %s", subject, user["ownerId"], wantOwner)
+		}
+	}
+}
