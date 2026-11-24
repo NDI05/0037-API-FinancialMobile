@@ -130,3 +130,89 @@ func TestDecodeMessageMultipartBase64(t *testing.T) {
 		t.Fatalf("multipart/base64 body not decoded: %+v", parsed)
 	}
 }
+
+// Production Livin notification emails put the "Penerima" label alone on its line with the
+// business name on the next line (no colon). Fixtures used the inline form, so this stacked
+// layout regressed to merchant_missing during live UAT; both layouts must keep parsing.
+func TestParseLivinStackedLabelLayout(t *testing.T) {
+	body := `Halo Kak,
+
+Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal: 24 Nov 2026 09:30:45
+
+Terima kasih telah menggunakan Livin' by Mandiri.
+`
+	decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := ParseLivinNotification(decoded)
+	if parsed.Status != "PARSED" {
+		t.Fatalf("stacked label layout must parse, got %+v", parsed)
+	}
+	if parsed.MerchantLabel != "WARUNG SEDERHANA" {
+		t.Fatalf("merchant = %q, want WARUNG SEDERHANA", parsed.MerchantLabel)
+	}
+	if parsed.AmountMinor != 25000 {
+		t.Fatalf("amount = %d, want 25000", parsed.AmountMinor)
+	}
+	want := time.Date(2026, 11, 24, 9, 30, 45, 0, jakarta)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+}
+
+// A bare downstream line that is itself a label or an identifier must not be accepted as the
+// business name.
+func TestParseLivinStackedLabelRejectsIdentifiers(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+936009110000123456
+
+Nominal Transaksi Rp 10.000,00
+Tanggal: 24 Nov 2026 09:30:45
+`
+	decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := ParseLivinNotification(decoded)
+	if parsed.Status == "PARSED" {
+		t.Fatalf("identifier must not become a merchant label: %+v", parsed)
+	}
+}
+
+// Production emails stack the time on the line after the date with a "pkl" marker.
+func TestParseLivinStackedDateTimeLayout(t *testing.T) {
+	body := `Halo Kak,
+
+Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+pkl 09:30:45 WIB
+
+Terima kasih telah menggunakan Livin' by Mandiri.
+`
+	decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := ParseLivinNotification(decoded)
+	if parsed.Status != "PARSED" {
+		t.Fatalf("stacked date/time layout must parse, got %+v", parsed)
+	}
+	want := time.Date(2026, 11, 24, 9, 30, 45, 0, jakarta)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+}

@@ -35,6 +35,11 @@ var (
 
 	labelKeyPattern = regexp.MustCompile(`(?i)^(penerima|nama penerima|merchant|nama merchant|` +
 		`toko|nama toko|biller|nama biller|merchant name|recipient)\s*[:\-]\s*(.+)$`)
+	// labelBarePattern handles the production Livin layout where the label sits alone on its line
+	// and the business name follows on the next line (no colon). Fixtures used inline labels; real
+	// notification emails use the stacked form, so both must parse.
+	labelBarePattern = regexp.MustCompile(`(?i)^(penerima|nama penerima|merchant|nama merchant|` +
+		`toko|nama toko|biller|nama biller|merchant name|recipient)\s*:?\s*$`)
 	amountPattern = regexp.MustCompile(`(?i)(?:jumlah|nominal|total(?:\s+pembayaran)?|amount|` +
 		`nominal transaksi)\s*[:\-]?\s*(?:rp\.?\s*)?([0-9][0-9.,]*)`)
 	standaloneAmountPattern = regexp.MustCompile(`(?i)rp\.?\s*([0-9][0-9.,]*)`)
@@ -43,6 +48,9 @@ var (
 	referencePattern = regexp.MustCompile(`(?i)(?:no\.?\s*referensi|nomor referensi|reference|` +
 		`ref(?:erence)?\s*(?:no|number)?|no\.?\s*transaksi)\s*[:\-]?\s*([A-Za-z0-9.\-]{4,64})`)
 	identifierPattern = regexp.MustCompile(`^[0-9][0-9 .\-/:]*$`)
+	// dateLabelPattern strips the inline label words that travel with the date value in the
+	// stacked production layout. Case-insensitive because production prints "Tanggal".
+	dateLabelPattern = regexp.MustCompile(`(?i)\b(?:pkl\.?|tanggal|waktu|pukul)\b\s*`)
 
 	dateLayouts = []string{
 		"02 Jan 2006 15:04:05",
@@ -158,17 +166,23 @@ func findLabel(lines []string, reference string) string {
 	bestRank := 99
 	best := ""
 	for index, line := range lines {
-		match := labelKeyPattern.FindStringSubmatch(line)
-		if match == nil {
+		key := ""
+		value := ""
+		if match := labelKeyPattern.FindStringSubmatch(line); match != nil {
+			key = strings.ToLower(strings.TrimSpace(match[1]))
+			value = strings.TrimSpace(match[2])
+		} else if match := labelBarePattern.FindStringSubmatch(line); match != nil {
+			key = strings.ToLower(strings.TrimSpace(match[1]))
+			if index+1 < len(lines) {
+				value = strings.TrimSpace(lines[index+1])
+			}
+		}
+		if key == "" {
 			continue
 		}
-		key := strings.ToLower(strings.TrimSpace(match[1]))
-		value := strings.TrimSpace(match[2])
-		if value == "" && index+1 < len(lines) {
-			value = strings.TrimSpace(lines[index+1])
-		}
 		value = strings.Trim(value, " :-\t")
-		if value == "" || isIdentifierLabel(value) || isReferenceValue(value, reference) {
+		if value == "" || isIdentifierLabel(value) || isReferenceValue(value, reference) ||
+			labelBarePattern.MatchString(value) || labelKeyPattern.MatchString(value) {
 			continue
 		}
 		if rank := priority[key]; rank < bestRank {
@@ -285,6 +299,18 @@ func findEventAt(lines []string) (time.Time, bool) {
 			return parsed, true
 		}
 	}
+	// Production notifications stack the local time on the line after the date, e.g.
+	// "Tanggal 24 Nov 2026" + "pkl 09:30:45 WIB". Joined pairs are tried before single lines so the
+	// time is not lost to a date-only layout.
+	for index := 0; index+1 < len(lines); index++ {
+		joined := lines[index] + " " + lines[index+1]
+		if len(strings.Fields(joined)) < 3 {
+			continue
+		}
+		if parsed, ok := parseDateValue(joined); ok {
+			return parsed, true
+		}
+	}
 	for _, line := range lines {
 		if parsed, ok := parseDateValue(line); ok {
 			return parsed, true
@@ -295,7 +321,9 @@ func findEventAt(lines []string) (time.Time, bool) {
 
 func parseDateValue(raw string) (time.Time, bool) {
 	raw = strings.TrimSpace(raw)
-	raw = strings.ReplaceAll(raw, "pukul", "")
+	// Label words and the short time marker travel with the value in the stacked production
+	// layout ("Tanggal 24 Nov 2026 pkl 09:30:45 WIB"); drop them so the date layouts apply.
+	raw = dateLabelPattern.ReplaceAllString(raw, "")
 	for _, suffix := range []string{"WIB", "WIT", "WITA"} {
 		raw = strings.ReplaceAll(raw, suffix, "")
 	}
