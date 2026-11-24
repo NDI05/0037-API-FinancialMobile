@@ -195,6 +195,18 @@ func TestManualSyncCooldownThenCoalesces(t *testing.T) {
 	if status.SyncState != "idle" || status.NeedsReauth {
 		t.Fatalf("post-drain status = %#v", status)
 	}
+	// Draining retires the cooldown marker, so a fresh manual request is accepted right away;
+	// only in-flight/pending requests are throttled (verified on the owner phone 24 Nov 2026).
+	again, err := f.Service.RequestSync(ctx, f.Owner)
+	if err != nil {
+		t.Fatalf("post-drain manual sync: %v", err)
+	}
+	if again.Coalesced || again.RequestedAt.IsZero() {
+		t.Fatalf("post-drain sync = %#v", again)
+	}
+	if status, err := f.Service.Status(ctx, f.Owner); err != nil || status.SyncRequestedAt.IsZero() {
+		t.Fatalf("post-drain accepted sync missing marker: %#v err=%v", status, err)
+	}
 }
 
 func TestManualSyncRejectedWhenNeedsReauth(t *testing.T) {
