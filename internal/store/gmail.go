@@ -590,7 +590,7 @@ func (s *Store) EnsureGmailDeltaJob(ctx context.Context, ownerID string, start, 
 	if !errors.Is(err, sql.ErrNoRows) {
 		return GmailSyncJob{}, err
 	}
-	// ON CONFLICT DO NOTHING plus the partial unique index (migration 018) means a concurrent
+	// ON CONFLICT DO NOTHING plus the partial unique index (migration 019) means a concurrent
 	// writer wins atomically and we simply reuse its job.
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO gmail_sync_jobs
 		(id, owner_id, kind, state, period_start, period_end, created_at, updated_at)
