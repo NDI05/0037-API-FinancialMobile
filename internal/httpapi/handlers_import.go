@@ -149,6 +149,14 @@ func (s *Server) finalizeImportJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info, _ := authFrom(r)
+	current, err := s.Store.GetImportJob(r.Context(), info.OwnerID, r.PathValue("id"))
+	if err != nil {
+		s.mapWriteError(w, r, err)
+		return
+	}
+	if !s.retainMonth(w, r, current.MonthID) {
+		return
+	}
 	job, err := s.Store.FinalizeImportJob(r.Context(), info.OwnerID, r.PathValue("id"),
 		body.State, body.ErrorCode, s.Now())
 	if err != nil {

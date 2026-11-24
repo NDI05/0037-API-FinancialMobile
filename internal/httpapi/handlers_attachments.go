@@ -48,10 +48,10 @@ func attachmentJSON(attachment store.Attachment) map[string]any {
 	}
 }
 
-// retainAttachment applies the one-year window through the linked transaction. Attachments with no
-// transaction (device-only metadata) carry no period identity and stay reachable; an attachment
-// whose transaction is already gone is treated as expired metadata (404). Direct by-id reads and
-// writes must not bypass the same window the list/create paths enforce.
+// retainAttachment applies the one-year window through the linked transaction. An attachment whose
+// transaction is already gone is treated as expired metadata (404). Direct by-id reads and writes
+// must not bypass the same window the list/create paths enforce. The empty-transaction branch is
+// defensive only: migrations require transaction_id NOT NULL, so it is currently unreachable.
 func (s *Server) retainAttachment(w http.ResponseWriter, r *http.Request, ownerID string,
 	attachment store.Attachment) bool {
 	if attachment.TransactionID == "" {

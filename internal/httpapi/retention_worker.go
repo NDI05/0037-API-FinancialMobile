@@ -66,6 +66,13 @@ func (w *RetentionWorker) sweep() {
 	result, err := w.api.Store.SweepRetention(ctx, w.api.Now(), mode)
 	if err != nil {
 		// Counting/deleting never touches request bodies, so the error is schema/DB level only.
+		// Record the abort in its own short-lived context: the sweep context may already be
+		// cancelled, and the audit row is the only trace operations get for this run.
+		auditCtx, auditCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		if auditErr := w.api.Store.RecordRetentionSweepFailure(auditCtx, w.api.Now(), mode, "sweep_failed"); auditErr != nil {
+			w.api.Log.Warn("retention_sweep_audit_failed", "code", "audit_write_failed")
+		}
+		auditCancel()
 		w.api.Log.Warn("retention_sweep_failed", "mode", string(mode), "error", err.Error())
 		return
 	}

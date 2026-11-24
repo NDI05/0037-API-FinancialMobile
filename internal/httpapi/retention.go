@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -123,10 +124,13 @@ func (s *Server) internalRetentionSweep(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		// The COMPLETED row shares the deletion transaction, so an abort leaves no partial deletion.
 		// A separate FAILED row keeps "every run is auditable" true without pretending the run
-		// finished; failure to write it must not mask the original error.
-		if auditErr := s.Store.RecordRetentionSweepFailure(r.Context(), s.Now(), mode, "sweep_failed"); auditErr != nil {
+		// finished; failure to write it must not mask the original error. The insert runs without
+		// the request context so a client timeout/cancel still leaves the audit trace behind.
+		auditCtx, auditCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		if auditErr := s.Store.RecordRetentionSweepFailure(auditCtx, s.Now(), mode, "sweep_failed"); auditErr != nil {
 			s.Log.Warn("retention_sweep_audit_failed", "code", "audit_write_failed")
 		}
+		auditCancel()
 		s.databaseOrInternal(w, r, err)
 		return
 	}

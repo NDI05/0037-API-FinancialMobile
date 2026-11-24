@@ -258,6 +258,7 @@ func TestRetentionGuardsCoverDerivativeAttachmentPaths(t *testing.T) {
 	if status != 201 {
 		t.Fatalf("create transaction = %d %#v", status, body)
 	}
+	txID := body["id"].(string)
 	status, created := h.request("POST", "/v1/attachments", token, map[string]any{
 		"transactionId": body["id"], "fileName": "baru.pdf", "mimeType": "application/pdf",
 		"sizeBytes": 10, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -285,6 +286,28 @@ func TestRetentionGuardsCoverDerivativeAttachmentPaths(t *testing.T) {
 	if status, body := h.request("GET", "/v1/attachments/"+knownAttachment, token, nil); status != 200 {
 		t.Fatalf("in-window attachment = %d %#v", status, body)
 	}
+	if status, body := h.request("GET", "/v1/attachments?transactionId="+txID, token, nil); status != 200 {
+		t.Fatalf("in-window filtered list = %d %#v", status, body)
+	}
+	// In-window mutation/deletion must still work: the guard only blocks expired period data.
+	status, body = h.request("PATCH", "/v1/attachments/"+knownAttachment, token, map[string]any{
+		"fileName": "baru-diubah.pdf", "revision": 0,
+	})
+	if status != 200 {
+		t.Fatalf("in-window attachment patch = %d %#v", status, body)
+	}
+	status, createdDelete := h.request("POST", "/v1/attachments", token, map[string]any{
+		"transactionId": txID, "fileName": "hapus.pdf", "mimeType": "application/pdf",
+		"sizeBytes": 11, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"storageRef": "attachments/2026/11/hapus.pdf",
+	})
+	if status != 201 {
+		t.Fatalf("create attachment to delete = %d %#v", status, createdDelete)
+	}
+	status, body = h.request("DELETE", "/v1/attachments/"+createdDelete["id"].(string)+"?revision=0", token, nil)
+	if status != 204 {
+		t.Fatalf("in-window attachment delete = %d %#v", status, body)
+	}
 
 	status, list := h.request("GET", "/v1/attachments", token, nil)
 	if status != 200 {
@@ -297,6 +320,18 @@ func TestRetentionGuardsCoverDerivativeAttachmentPaths(t *testing.T) {
 	if got := items[0].(map[string]any)["id"]; got != knownAttachment {
 		t.Fatalf("unfiltered list kept %v, want %s", got, knownAttachment)
 	}
+
+	// A linked transaction that is already soft-deleted means the metadata has no live period
+	// owner; by-id access must be 404 rather than an internal error or a stale 200.
+	if _, err := h.store.DB.ExecContext(context.Background(),
+		`UPDATE transactions SET deleted_at = ? WHERE id = ?`,
+		retentionTestNow.UTC().Format(time.RFC3339Nano), txID); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := h.request("GET", "/v1/attachments/"+knownAttachment, token, nil); status != 404 {
+		t.Fatalf("attachment of soft-deleted transaction = %d %#v, want 404", status, body)
+	}
+
 }
 
 // Import job metadata is period data: reading a job whose month left the window is a 4xx policy
@@ -328,5 +363,102 @@ func TestRetentionGuardCoversImportJobRead(t *testing.T) {
 	}
 	if status, _ := h.request("GET", "/v1/import-jobs/"+created["id"].(string), token, nil); status != 200 {
 		t.Fatalf("in-window import job read = %d", status)
+	}
+}
+
+// A scheduled sweep that aborts must leave a FAILED audit row behind, exactly like the internal
+// endpoint does; otherwise operations cannot tell "policy ran and failed" from "policy never ran".
+func TestRetentionWorkerRecordsFailedAudit(t *testing.T) {
+	h := newHarnessWithConfig(t, &llm.Fake{Scenario: "valid"}, map[string]string{
+		"RETENTION_SWEEP_ENABLED": "true",
+	})
+	pinRetentionClock(h)
+	h.register("retention-worker-fail@example.test")
+	ownerID := ownerIDForEmail(t, h, "retention-worker-fail@example.test")
+	insertExpiredTransaction(t, h, ownerID, "tx_old_worker", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	// Break the sweep midway (a table it deletes from is gone) after the audit table still works.
+	if _, err := h.store.DB.ExecContext(context.Background(), `DROP TABLE import_skipped`); err != nil {
+		t.Fatal(err)
+	}
+	NewRetentionWorker(h.api).sweep()
+
+	var status, errorCode string
+	if err := h.store.DB.QueryRowContext(context.Background(),
+		`SELECT status, error_code FROM retention_sweeps ORDER BY started_at DESC LIMIT 1`).
+		Scan(&status, &errorCode); err != nil {
+		t.Fatalf("scheduled sweep must write an audit row: %v", err)
+	}
+	if status != "FAILED" || errorCode != "sweep_failed" {
+		t.Fatalf("worker audit = %s/%s, want FAILED/sweep_failed", status, errorCode)
+	}
+}
+
+// The HTTP sweep failure path detaches the audit insert from the request context, so a cancelled
+// client request cannot erase the only trace of the aborted run.
+func TestRetentionSweepRecordsFailedAudit(t *testing.T) {
+	h := newHarnessWithConfig(t, &llm.Fake{Scenario: "valid"}, map[string]string{
+		"INTERNAL_SWEEP_TOKEN": "retention-fail-token",
+	})
+	pinRetentionClock(h)
+	h.register("retention-sweep-fail@example.test")
+	ownerID := ownerIDForEmail(t, h, "retention-sweep-fail@example.test")
+	insertExpiredTransaction(t, h, ownerID, "tx_old_fail", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	if _, err := h.store.DB.ExecContext(context.Background(), `DROP TABLE import_skipped`); err != nil {
+		t.Fatal(err)
+	}
+	status, body := h.requestWithHeaders("POST", "/v1/internal/retention-sweep", "", nil,
+		map[string]string{"x-internal-token": "retention-fail-token"})
+	if status < 500 || body["code"] != "internal_error" {
+		t.Fatalf("failed sweep = %d %#v, want 5xx internal_error", status, body)
+	}
+	var count int
+	if err := h.store.DB.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM retention_sweeps WHERE status = 'FAILED' AND error_code = 'sweep_failed'`).
+		Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("FAILED audit rows = %d, want 1", count)
+	}
+}
+
+// Finalizing a job from an expired month is metadata mutation of period data, so it is refused
+// like create/batch/read instead of writing counters for a month that already left the window.
+func TestRetentionFinalizeImportJobExpiredMonth(t *testing.T) {
+	h := newHarnessWithConfig(t, &llm.Fake{Scenario: "valid"}, map[string]string{
+		"INTERNAL_SWEEP_TOKEN": "retention-finalize-token",
+	})
+	pinRetentionClock(h)
+	h.register("retention-finalize@example.test")
+	token, _ := h.login("retention-finalize@example.test")
+	grantRetentionConsent(t, h, token, "GMAIL_READ")
+	ownerID := ownerIDForEmail(t, h, "retention-finalize@example.test")
+
+	if _, err := h.store.DB.ExecContext(context.Background(), `INSERT INTO import_jobs
+		(id, owner_id, month_id, state, template_version, started_at)
+		VALUES ('job_expired_finalize', ?, '2024-01', 'RUNNING', 'v1', ?)`,
+		ownerID, retentionTestNow.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	status, body := h.request("PATCH", "/v1/import-jobs/job_expired_finalize", token, map[string]any{
+		"state": "COMPLETE",
+	})
+	if status != 400 || body["code"] != "outside_retention" {
+		t.Fatalf("expired finalize = %d %#v, want 400 outside_retention", status, body)
+	}
+
+	status, created := h.request("POST", "/v1/import-jobs", token, map[string]any{
+		"monthId": "2026-11", "templateVersion": "v1",
+	})
+	if status != 201 {
+		t.Fatalf("in-window import job = %d %#v", status, created)
+	}
+	status, body = h.request("PATCH", "/v1/import-jobs/"+created["id"].(string), token, map[string]any{
+		"state": "FAILED", "errorCode": "import_aborted",
+	})
+	if status != 200 {
+		t.Fatalf("in-window finalize = %d %#v", status, body)
 	}
 }

@@ -57,8 +57,10 @@ Deliberate exemptions and decisions:
 - Direct transaction reads (`GET /v1/transactions/{id}`) only enforce the lower bound, because
   cleanup is what actually removes fully expired rows. Attachment metadata resolved by id enforces
   the same one-year window as its list/create paths; an attachment whose transaction is already
-  gone is treated as expired metadata (`404`). Attachments with no transaction are not period data
-  and stay reachable.
+  gone is treated as expired metadata (`404`). The helper also has a defensive branch for an
+  attachment without a transaction, but the current schema makes that state unreachable
+  (`attachments.transaction_id` is `NOT NULL`, migration 015); the branch is kept only so a future
+  device-only attachment type cannot silently bypass the window.
 - Device-side attachment blobs are never deleted server-side; the sweep only removes metadata rows.
 - Any DB failure remains a 5xx; retention checks never mask an infrastructure error as 4xx.
 
