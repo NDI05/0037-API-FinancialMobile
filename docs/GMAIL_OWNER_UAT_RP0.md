@@ -48,6 +48,14 @@ Billing tanpa keputusan pemilik.
 5. **Jalankan backend UAT lokal** (lihat bagian 3), lalu **UAT dari Android Studio** pada HP
    fisik (lihat panduan Android). Backend hanya mendengarkan di loopback; jangan membuka port
    ke internet, jangan memakai reverse proxy publik.
+6. **Cek kesiapan otomatis sebelum Run** (dari root repo Android, read-only, tanpa secret):
+   ```bash
+   ./scripts/verify/uat_readiness.sh --backend-url http://127.0.0.1:18090 \
+     --apk app/build/outputs/apk/debug/app-debug.apk
+   ```
+   Exit `0` = prasyarat otomatis siap; `2` = daftar prasyarat yang kurang; `1` = gagal teknis.
+   Gate Gmail live (G25) dan Rp0 (G29/G37) tetap dilaporkan terpisah; SSO/onboarding mengikuti
+   `pam-app/docs/GOOGLE_SSO_OWNER_SETUP.md` (gate G36).
 
 ## 3. Menjalankan backend UAT
 
