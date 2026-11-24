@@ -44,7 +44,9 @@ func newGmailHarness(t *testing.T) *gmailHarness {
 	}
 	service := gmail.NewService(h.store, provider, oauth, gmail.Settings{
 		RedirectURI: "https://api.example.test/v1/gmail/connect/callback",
-		TopicName:   "projects/pam/topics/gmail", AppDeepLink: "pam://gmail/connected",
+		// These legacy tests exercise the push transport; polling is covered in gmail_polling_test.go.
+		Mode:      "push",
+		TopicName: "projects/pam/topics/gmail", AppDeepLink: "pam://gmail/connected",
 	}, testLogger())
 	h.api.SetGmail(service, &gmail.FakePushVerifier{
 		Token:  "push-token",

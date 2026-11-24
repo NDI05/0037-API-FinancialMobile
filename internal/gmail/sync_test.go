@@ -94,7 +94,9 @@ func newSyncFixtureMonths(t *testing.T, backfillMonths int) *syncFixture {
 	categories := &fakeCategories{}
 	service := NewService(data, provider, exchanger, Settings{
 		RedirectURI: "https://api.example.test/v1/gmail/connect/callback",
-		TopicName:   "projects/pam/topics/gmail", BackfillMonths: backfillMonths, PageSize: 10,
+		// These tests exercise the legacy push transport; polling has its own tests below.
+		Mode:      "push",
+		TopicName: "projects/pam/topics/gmail", BackfillMonths: backfillMonths, PageSize: 10,
 		MaxPagesPerRun: 5, WatchRenewBefore: 24 * time.Hour,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	service.Now = func() time.Time { return now }
@@ -267,17 +269,17 @@ func TestFailedPageRetriesWithoutLosingCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if connection.SyncState != "error" || connection.LastErrorCode != "provider_error" {
-		t.Fatalf("failure must be recorded: state=%s code=%s", connection.SyncState,
+	if connection.SyncState != "delta" || connection.LastErrorCode != "provider_error" {
+		t.Fatalf("retryable failure must stay retryable: state=%s code=%s", connection.SyncState,
 			connection.LastErrorCode)
 	}
 	var failedState string
 	if err := f.Store.DB.QueryRow(`SELECT state FROM gmail_sync_jobs WHERE owner_id = ?
-		AND kind = 'BACKFILL'`, f.Owner).Scan(&failedState); err != nil {
+		AND kind = 'DELTA'`, f.Owner).Scan(&failedState); err != nil {
 		t.Fatal(err)
 	}
-	if failedState != "FAILED" {
-		t.Fatalf("job state = %s, want FAILED", failedState)
+	if failedState != "CREATED" {
+		t.Fatalf("retryable job state = %s, want CREATED (open for the next tick)", failedState)
 	}
 
 	// The next tick retries the same month and completes.
@@ -451,7 +453,7 @@ func TestLateEmailImportsIntoTransactionMonth(t *testing.T) {
 		"late-nov": {ID: "late-nov", Raw: rawEmail("Pembayaran Berhasil!", livinBodyFor("31 Dec 2025 20:15:00"))},
 	}
 	f.Provider.Pages = []MessageList{{Messages: []MessageRef{{ID: "late-nov"}}}}
-	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-01", "", "late", func(pageProgress) error { return nil }); err != nil {
+	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-01", "", "late", "", func(pageProgress) error { return nil }); err != nil {
 		t.Fatalf("january scan: %v", err)
 	}
 	var monthID string
@@ -479,7 +481,7 @@ func TestLateEmailImportsIntoTransactionMonth(t *testing.T) {
 	}
 	// A replay of the same arrival scan must not duplicate the row.
 	f.Provider.Pages = []MessageList{{Messages: []MessageRef{{ID: "late-nov"}}}}
-	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-01", "", "late2", func(pageProgress) error { return nil }); err != nil {
+	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-01", "", "late2", "", func(pageProgress) error { return nil }); err != nil {
 		t.Fatalf("replay scan: %v", err)
 	}
 	if got := f.transactionCount(t); got != 1 {
@@ -497,7 +499,7 @@ func TestOutOfRetentionTransactionIsExplicitlySkipped(t *testing.T) {
 		"old": {ID: "old", Raw: rawEmail("Pembayaran Berhasil!", livinBodyFor("05 Jan 2026 10:00:00"))},
 	}
 	f.Provider.Pages = []MessageList{{Messages: []MessageRef{{ID: "old"}}}}
-	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-11", "", "retention", func(pageProgress) error { return nil }); err != nil {
+	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-11", "", "retention", "", func(pageProgress) error { return nil }); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	var reason string
