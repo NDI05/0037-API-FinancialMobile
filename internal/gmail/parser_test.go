@@ -216,3 +216,28 @@ Terima kasih telah menggunakan Livin' by Mandiri.
 		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
 	}
 }
+
+// Older production templates print the date with Indonesian month abbreviations.
+func TestParseLivinIndonesianMonthAbbreviation(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 12 Okt 2026
+pkl 09:30:45 WIB
+`
+	decoded, err := DecodeMessage(rawEmail("Pembayaran Berhasil!", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := ParseLivinNotification(decoded)
+	if parsed.Status != "PARSED" {
+		t.Fatalf("Indonesian month must parse, got %+v", parsed)
+	}
+	want := time.Date(2026, 10, 12, 9, 30, 45, 0, jakarta)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+}

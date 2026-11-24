@@ -51,6 +51,10 @@ var (
 	// dateLabelPattern strips the inline label words that travel with the date value in the
 	// stacked production layout. Case-insensitive because production prints "Tanggal".
 	dateLabelPattern = regexp.MustCompile(`(?i)\b(?:pkl\.?|tanggal|waktu|pukul)\b\s*`)
+	// indonesianMonths maps the Indonesian month names/abbreviations used by production mail
+	// ("12 Okt 2026", "5 Agustus 2026") to the English tokens the date layouts expect.
+	indonesianMonths = regexp.MustCompile(`(?i)\b(januari|februari|maret|april|mei|juni|juli|` +
+		`agustus|agu|agt|ags|september|oktober|okt|nopember|november|desember|des)\b`)
 
 	dateLayouts = []string{
 		"02 Jan 2006 15:04:05",
@@ -324,6 +328,36 @@ func parseDateValue(raw string) (time.Time, bool) {
 	// Label words and the short time marker travel with the value in the stacked production
 	// layout ("Tanggal 24 Nov 2026 pkl 09:30:45 WIB"); drop them so the date layouts apply.
 	raw = dateLabelPattern.ReplaceAllString(raw, "")
+	raw = indonesianMonths.ReplaceAllStringFunc(raw, func(word string) string {
+		switch strings.ToLower(word) {
+		case "januari":
+			return "Jan"
+		case "februari":
+			return "Feb"
+		case "maret":
+			return "Mar"
+		case "april":
+			return "Apr"
+		case "mei":
+			return "May"
+		case "juni":
+			return "Jun"
+		case "juli":
+			return "Jul"
+		case "agustus", "agu", "agt", "ags":
+			return "Aug"
+		case "september":
+			return "Sep"
+		case "oktober", "okt":
+			return "Oct"
+		case "nopember", "november":
+			return "Nov"
+		case "desember", "des":
+			return "Dec"
+		default:
+			return word
+		}
+	})
 	for _, suffix := range []string{"WIB", "WIT", "WITA"} {
 		raw = strings.ReplaceAll(raw, suffix, "")
 	}
