@@ -100,3 +100,80 @@ Tanpa menambah field API, perilaku berikut disepakati:
   `pam://gmail/connected`, tampilan status, dan tombol "Putuskan".
 - Polling status saat resume; jangan simpan token/email penuh di perangkat.
 - Consent PAM terpisah: Gmail, kategorisasi AI, Analisis AI.
+
+## 9. Revisi kontrak v2 — mode polling Rp0 + sinkron manual (24 Nov 2026)
+
+Status: **kontrak kerja v2**, pemilik repo backend. Perubahan aditif/backward compatible untuk
+klien lama; Android wajib memakai field/endpoint baru untuk UAT HP fisik.
+
+### 9.1 Mode transport
+
+- `GMAIL_MODE=polling` (default produksi UAT): OAuth, backfill, dan delta berjalan **tanpa**
+  Pub/Sub. Server tidak memanggil `users.watch`/`users.stop`, tidak menginisialisasi verifier
+  push, dan tidak mengekspos perilaku push. Endpoint `POST /v1/internal/gmail/push` tidak
+  terdaftar (404) pada mode ini.
+- `GMAIL_MODE=push` (opt-in rollback): perilaku Pub/Sub lama dipertahankan. Konfigurasi
+  `GMAIL_PUBSUB_TOPIC`, `GMAIL_PUSH_AUDIENCE`, `GMAIL_PUSH_SERVICE_ACCOUNT` wajib hanya pada
+  mode ini; pada mode polling nilainya boleh kosong dan diabaikan.
+- Koneksi lama yang masih memiliki watch dari mode push: pada mode polling watch tidak
+  diperpanjang dan dianggap kedaluwarsa; cursor/riwayat transaksi dipertahankan, tidak ada
+  reset. Transisi push → polling didokumentasikan di `GMAIL_API_SETUP.md`.
+
+### 9.2 Endpoint status (diperluas)
+
+`GET /v1/gmail/status` — field lama tetap; tambahan (null bila belum ada):
+
+```json
+{
+  "connected": true,
+  "account_email_masked": "a***@gmail.com",
+  "scope": "https://www.googleapis.com/auth/gmail.readonly",
+  "connected_at": "2026-11-24T07:00:00Z",
+  "last_sync_at": "2026-11-24T07:15:00Z",
+  "watch_expires_at": null,
+  "sync_state": "backfill",
+  "last_error_code": null,
+  "needs_reauth": false,
+  "last_attempt_at": "2026-11-24T07:15:00Z",
+  "last_success_at": "2026-11-24T07:10:00Z",
+  "next_sync_at": "2026-11-24T07:30:00Z",
+  "sync_requested_at": null,
+  "progress": {
+    "phase": "backfill",
+    "month": "2026-11",
+    "months_done": 2,
+    "months_total": 12,
+    "pages_done": 3
+  }
+}
+```
+
+- `needs_reauth=true` berarti grant dicabut/token tidak dapat diperbarui; Android menampilkan
+  CTA **Tautkan ulang Gmail** ke layar kontrak §1–§2.
+- `sync_state` tetap `idle|backfill|delta|error`; `progress` boleh `null` saat idle.
+- Semua waktu UTC RFC3339; UI memformat WIB. Endpoint tidak pernah mengembalikan email penuh,
+  token, ID pesan, atau isi email.
+
+### 9.3 Sinkronkan sekarang
+
+`POST /v1/gmail/sync` — auth Bearer wajib.
+
+- `202 {"queued": true, "coalesced": false, "requested_at": "...", "next_allowed_at": "..."}`
+  Permintaan masuk antrean durable yang sama dengan worker; selamat setelah restart.
+- Jika job/permintaan aktif untuk owner yang sama: `202 {"queued": true, "coalesced": true, ...}`
+  (tidak membuat job kedua).
+- Dalam cooldown (default 60 s): `429 {"code": "sync_cooldown", "retryable": true,
+  "retryAfterSeconds": 24}`.
+- Gmail belum aktif: `503 gmail_disabled`; belum terhubung: `409 gmail_not_connected`.
+- Endpoint hanya mengantrekan; tidak menunggu job selesai dan tidak pernah memulai impor saat
+  sheet dibuka.
+
+### 9.4 Perilaku worker
+
+- Delta otomatis minimal setiap **15 menit** per owner (`GMAIL_DELTA_INTERVAL_SECONDS=900`);
+  timer tidak menumpuk job dan tidak memanggil Gmail saat belum due.
+- Backfill 12 bulan berjalan bertahap (maksimum halaman per tick) dan **memberi giliran** kepada
+  delta: delta due diproses lebih dulu, lalu satu unit backfill.
+- Satu owner maksimal satu job DELTA terbuka (unique index 019). Permintaan manual bergabung
+  dengan job aktif, dedupe per owner+jenis, dan cooldown dihitung dari permintaan terakhir.
+- Mode polling kosong: nol unduhan isi email dan nol panggilan kategori/Azure.
