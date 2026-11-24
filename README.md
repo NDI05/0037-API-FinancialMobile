@@ -184,7 +184,7 @@ PAN/No. Referensi tidak pernah disimpan atau di-log. Tes memakai provider palsu:
 ## Struktur
 
 ```
-cmd/api, cmd/pam-admin     bootstrap HTTP dan utilitas admin
+cmd/api, cmd/pam-admin     bootstrap HTTP; cmd/pam-admin legacy ops-only pasca-CR-008 (tidak dipakai produk)
 internal/config            environment + production secret checks
 internal/crypto            AES-256-GCM (kompatibel format Node)
 internal/auth              scrypt, JWT HS256, refresh token
