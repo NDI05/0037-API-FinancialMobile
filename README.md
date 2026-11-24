@@ -2,7 +2,7 @@
 
 Backend resmi PAM: REST API, sinkronisasi Gmail dengan **polling default 15 menit** (push Pub/Sub
 hanya opt-in rollback), impor riwayat Livin setahun, satu job kategorisasi Azure Foundry,
-retensi setahun, dan dukungan lampiran/analisis.
+retensi setahun, dan dukungan analisis. Modul lampiran transaksi pensiun menurut CR-008.
 
 Repositori Android (klien): <https://github.com/NDI05/0037_FinancialMobile>.
 Kontrak API: [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
@@ -48,7 +48,7 @@ dipisahkan menjadi repository ini (lihat [Asal repo](#asal-repo)).
 - **Koreksi kategori pengguna mengalahkan classifier, antrean otomatis target 2 jam** ([66c0f8a](https://github.com/NDI05/0037-Backend-Financial/commit/66c0f8a), [3b1cc99](https://github.com/NDI05/0037-Backend-Financial/commit/3b1cc99), [96de52f](https://github.com/NDI05/0037-Backend-Financial/commit/96de52f), [c6fde5d](https://github.com/NDI05/0037-Backend-Financial/commit/c6fde5d)). Hasil dipetakan lewat `caseId`, orphan disapu atomik, lease di-fence, dan antrean kategori berjalan otomatis dengan indikator pembaruan. *Status: lulus uji + bukti runtime saat itu.*
 - **Kontrak server S2.4: paging, revisi, dan coverage ringkasan** ([edab1c6](https://github.com/NDI05/0037-Backend-Financial/commit/edab1c6)). Halaman/revisi transaksi dan `coverage` ringkasan (COMPLETE/PARTIAL/EMPTY/FAILED) menjadi kontrak resmi klien. *Status: lulus uji kontrak.*
 - **API lampiran dan administrasi (S4) — riwayat, kini pensiun** ([266ee7f](https://github.com/NDI05/0037-Backend-Financial/commit/266ee7f), [1087d82](https://github.com/NDI05/0037-Backend-Financial/commit/1087d82), [5e4fc19](https://github.com/NDI05/0037-Backend-Financial/commit/5e4fc19)). Metadata lampiran, akun admin/undangan/audit, dan CLI provisioning sempat dibangun untuk S4; **CR-008 (SRS v0.7) mengeluarkan ketiganya dari jalur aktif** dan rutenya dihapus kemudian ([1d020bc](https://github.com/NDI05/0037-Backend-Financial/commit/1d020bc)) dengan tabel/data tetap dipertahankan. *Status: historis; pensiun.*
-- **Repo Go berdiri sendiri** ([327d876](https://github.com/NDI05/0037-Backend-Financial/commit/327d876)). Source diekstrak dari `0037_FinancialMobile` path `backend-go/` pada commit [70d1535](https://github.com/NDI05/0037_FinancialMobile/commit/70d1535) (Android), dokumentasi kontrak dipindah ([cd0f91a](https://github.com/NDI05/0037_FinancialMobile/commit/cd0f91a)), 32 commit riwayat dipertahankan; sejak commit ini repo Go berdiri sendiri. *Status: selesai; parity P1–P7 PASS.*
+- **Repo Go berdiri sendiri** ([327d876](https://github.com/NDI05/0037-Backend-Financial/commit/327d876)). Source diekstrak dari `0037_FinancialMobile` path `backend-go/` pada commit sumber [cd0f91a](https://github.com/NDI05/0037_FinancialMobile/commit/cd0f91a) (Android; commit [70d1535](https://github.com/NDI05/0037_FinancialMobile/commit/70d1535) adalah langkah pemindahan yang menghapus path itu), 32 commit riwayat dipertahankan; sejak commit ini repo Go berdiri sendiri. *Status: selesai; parity P1–P7 PASS.*
 - **Gmail API: store, klien MIME/parser Livin, OAuth PKCE, dan rute** ([249dcb9](https://github.com/NDI05/0037-Backend-Financial/commit/249dcb9), [273fd88](https://github.com/NDI05/0037-Backend-Financial/commit/273fd88), [0d124d4](https://github.com/NDI05/0037-Backend-Financial/commit/0d124d4), [eae4903](https://github.com/NDI05/0037-Backend-Financial/commit/eae4903)). Koneksi Gmail, state OAuth, push event, job sync, worker backfill/delta bergulir, serta rute connect/status/disconnect; push Pub/Sub hanya opt-in rollback. *Status: lulus uji + UAT fixture.*
 - **Retensi setahun WIB dan pembersihan CR-005** ([a05994c](https://github.com/NDI05/0037-Backend-Financial/commit/a05994c), [f1625b5](https://github.com/NDI05/0037-Backend-Financial/commit/f1625b5), [aa24518](https://github.com/NDI05/0037-Backend-Financial/commit/aa24518)). Jendela finansial bergulir 12 bulan + bulan tertua parsial, clamp 29 Feb, sweep REPORT_ONLY/DELETE dengan audit, dan guard lampiran/import-job. *Status: lulus uji; `RETENTION_DELETE_ENABLED` tetap OFF sampai keputusan pemilik.*
 - **Routing bulan transaksi, reset ganti mailbox, dan merge lintas sumber** ([85f8c28](https://github.com/NDI05/0037-Backend-Financial/commit/85f8c28)). Transaksi ditempatkan di bulan event, koneksi Gmail baru me-reset cursor dengan benar, dan duplikat lintas sumber dicegah. *Status: lulus uji.*
@@ -62,7 +62,8 @@ dipisahkan menjadi repository ini (lihat [Asal repo](#asal-repo)).
 ## Asal repo
 
 Source diekstrak dari `0037_FinancialMobile` path `backend-go/` pada commit `cd0f91a`
-(subtree split, 32 commit riwayat dipertahankan). Pemilik kontrak API: repo ini; klien Android
+(subtree split, 32 commit riwayat dipertahankan); commit `70d1535` di repo Android adalah
+langkah pemindahan yang menghapus `backend-go/` dari klien. Pemilik kontrak API: repo ini; klien Android
 mengikuti `docs/API_CONTRACT.md`.
 
 ## Toolchain
@@ -187,7 +188,7 @@ cmd/api, cmd/pam-admin     bootstrap HTTP dan utilitas admin
 internal/config            environment + production secret checks
 internal/crypto            AES-256-GCM (kompatibel format Node)
 internal/auth              scrypt, JWT HS256, refresh token
-internal/store             database/sql libSQL + migrasi 001–020
+internal/store             database/sql libSQL + migrasi 001–021
 internal/finance           kalkulator deterministik BR-01…BR-06
 internal/gmail             OAuth/PKCE, klien Gmail API, parser Livin, worker sinkronisasi
 internal/categoryllm       kategorisasi Azure Foundry + cache/budget
