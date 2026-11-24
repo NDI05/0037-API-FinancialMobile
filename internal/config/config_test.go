@@ -178,3 +178,92 @@ func TestGmailConfigurationDefaultsAndValidation(t *testing.T) {
 		t.Fatal("a plain-HTTP redirect URI must be rejected")
 	}
 }
+
+func TestGmailPollingModeDefaultsAndFakeGuard(t *testing.T) {
+	development := map[string]string{
+		"APP_ENV": "development", "DATABASE_URL": "file:./data/gmail-polling-test.db",
+		"GMAIL_ENABLED": "true", "GMAIL_CLIENT_ID": "client-id.apps.googleusercontent.com",
+		"GMAIL_CLIENT_SECRET": "client-secret",
+		// Polling is the default and must not require Pub/Sub settings.
+		"GMAIL_REDIRECT_URI": "https://api.example.test/v1/gmail/connect/callback",
+	}
+	cfg, err := Load(development)
+	if err != nil {
+		t.Fatalf("polling config without Pub/Sub rejected: %v", err)
+	}
+	if cfg.Gmail.Mode != "polling" || cfg.Gmail.Provider != "google" ||
+		cfg.Gmail.DeltaInterval != 15*time.Minute || cfg.Gmail.SyncCooldown != 60*time.Second {
+		t.Fatalf("unexpected polling defaults: %+v", cfg.Gmail)
+	}
+
+	push := map[string]string{}
+	for key, value := range development {
+		push[key] = value
+	}
+	push["GMAIL_MODE"] = "push"
+	if _, err := Load(push); err == nil {
+		t.Fatal("push mode without topic/audience/service account must fail closed")
+	}
+	push["GMAIL_PUBSUB_TOPIC"] = "projects/pam-uat/topics/gmail-push"
+	push["GMAIL_PUSH_AUDIENCE"] = "https://api.example.test/v1/internal/gmail/push"
+	push["GMAIL_PUSH_SERVICE_ACCOUNT"] = "pubsub-push@pam-uat.iam.gserviceaccount.com"
+	if _, err := Load(push); err != nil {
+		t.Fatalf("complete push config rejected: %v", err)
+	}
+
+	loopback := map[string]string{}
+	for key, value := range development {
+		loopback[key] = value
+	}
+	loopback["GMAIL_ALLOW_LOOPBACK_REDIRECT"] = "true"
+	loopback["GMAIL_REDIRECT_URI"] = "http://127.0.0.1:18099/v1/gmail/connect/callback"
+	if _, err := Load(loopback); err != nil {
+		t.Fatalf("loopback HTTP on an ephemeral port rejected: %v", err)
+	}
+	for name, uri := range map[string]string{
+		"localhost host":    "http://localhost:18099/v1/gmail/connect/callback",
+		"public host":       "http://api.example.test/v1/gmail/connect/callback",
+		"other path":        "http://127.0.0.1:18099/v1/gmail/status",
+		"other scheme":      "ftp://127.0.0.1/v1/gmail/connect/callback",
+		"query parameter":   "http://127.0.0.1:18099/v1/gmail/connect/callback?x=1",
+		"embedded userinfo": "http://user@127.0.0.1:18099/v1/gmail/connect/callback",
+	} {
+		changed := map[string]string{}
+		for key, value := range loopback {
+			changed[key] = value
+		}
+		changed["GMAIL_REDIRECT_URI"] = uri
+		if _, err := Load(changed); err == nil {
+			t.Fatalf("%s must be rejected", name)
+		}
+	}
+
+	production := productionEnv()
+	production["GMAIL_ENABLED"] = "true"
+	production["GMAIL_CLIENT_ID"] = "client-id.apps.googleusercontent.com"
+	production["GMAIL_CLIENT_SECRET"] = "client-secret"
+	production["GMAIL_ALLOW_LOOPBACK_REDIRECT"] = "true"
+	production["GMAIL_REDIRECT_URI"] = "http://127.0.0.1:18090/v1/gmail/connect/callback"
+	if _, err := Load(production); err == nil {
+		t.Fatal("production must never accept an HTTP loopback callback")
+	}
+
+	fake := map[string]string{}
+	for key, value := range loopback {
+		fake[key] = value
+	}
+	fake["GMAIL_PROVIDER"] = "fake"
+	fake["GMAIL_DEV_FIXTURE_FILE"] = "/tmp/pam-dev-fixture.json"
+	if _, err := Load(fake); err != nil {
+		t.Fatalf("valid fake provider config rejected: %v", err)
+	}
+	fake["APP_ENV"] = "production"
+	productionFake := productionEnv()
+	for key, value := range fake {
+		productionFake[key] = value
+	}
+	productionFake["APP_ENV"] = "production"
+	if _, err := Load(productionFake); err == nil {
+		t.Fatal("fake provider must be rejected outside development")
+	}
+}

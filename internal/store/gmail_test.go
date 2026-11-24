@@ -201,7 +201,7 @@ func TestGmailBackfillJobRetriesAndCheckpoint(t *testing.T) {
 	if err != nil || job.State != "RUNNING" {
 		t.Fatalf("start job: %+v %v", job, err)
 	}
-	if err := s.CheckpointGmailSyncJob(ctx, owner, job.ID, "page-2", 10, 8, 1, 1, now); err != nil {
+	if err := s.CheckpointGmailSyncJob(ctx, owner, job.ID, "page-2", 10, 8, 1, 1, 3, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.FinishGmailSyncJob(ctx, owner, job.ID, "FAILED", "provider_unavailable", now); err != nil {

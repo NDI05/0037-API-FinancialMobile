@@ -36,6 +36,7 @@ const (
 	gmailPurposeVerifier    = "gmail_oauth_verifier"
 	gmailPurposePush        = "gmail_push_payload"
 	gmailPurposePageToken   = "gmail_page_token"
+	gmailPurposeAccess      = "gmail_access_token"
 	gmailSyncStateIdle      = "idle"
 	gmailSyncStateBackfill  = "backfill"
 	gmailSyncStateDelta     = "delta"
@@ -57,13 +58,20 @@ type GmailConnection struct {
 	Scope            string
 	State            string
 	RefreshToken     string
-	WatchExpiresAt   time.Time
-	HistoryCursor    string
-	SyncState        string
-	LastSyncAt       time.Time
-	LastErrorCode    string
-	ConnectedAt      time.Time
-	UpdatedAt        time.Time
+	// AccessToken is the short-lived Google token, sealed at rest. The worker reuses it until
+	// shortly before AccessTokenExpiresAt instead of refreshing on every call.
+	AccessToken          string
+	AccessTokenExpiresAt time.Time
+	WatchExpiresAt       time.Time
+	HistoryCursor        string
+	SyncState            string
+	LastSyncAt           time.Time
+	LastErrorCode        string
+	LastAttemptAt        time.Time
+	LastSuccessAt        time.Time
+	SyncRequestedAt      time.Time
+	ConnectedAt          time.Time
+	UpdatedAt            time.Time
 }
 
 type GmailConnectionInput struct {
@@ -249,12 +257,17 @@ func (s *Store) SaveGmailConnection(ctx context.Context, input GmailConnectionIn
 	return s.GetGmailConnection(ctx, input.OwnerID)
 }
 
+// gmailConnectionColumns keeps every reader in sync with the additive columns from migration 020.
+const gmailConnectionColumns = `id, owner_id, account_email_hash,
+	account_email_ciphertext, account_email_iv, account_email_tag, account_email_key_version,
+	scope, state, refresh_token_ciphertext, refresh_token_iv, refresh_token_tag,
+	refresh_token_key_version, watch_expires_at, history_cursor, sync_state, last_sync_at,
+	last_error_code, access_token_ciphertext, access_token_iv, access_token_tag,
+	access_token_key_version, access_token_expires_at, last_attempt_at, last_success_at,
+	sync_requested_at, connected_at, updated_at`
+
 func (s *Store) GetGmailConnection(ctx context.Context, ownerID string) (GmailConnection, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, owner_id, account_email_hash,
-		account_email_ciphertext, account_email_iv, account_email_tag, account_email_key_version,
-		scope, state, refresh_token_ciphertext, refresh_token_iv, refresh_token_tag,
-		refresh_token_key_version, watch_expires_at, history_cursor, sync_state, last_sync_at,
-		last_error_code, connected_at, updated_at
+	row := s.DB.QueryRowContext(ctx, `SELECT `+gmailConnectionColumns+`
 		FROM gmail_connections WHERE owner_id = ?`, ownerID)
 	return s.scanGmailConnection(row)
 }
@@ -262,28 +275,28 @@ func (s *Store) GetGmailConnection(ctx context.Context, ownerID string) (GmailCo
 // GmailConnectionByEmailHash resolves the owner for a Pub/Sub push. It only ever returns an
 // ACTIVE connection, so a disconnected mailbox cannot reopen work.
 func (s *Store) GmailConnectionByEmailHash(ctx context.Context, emailHash string) (GmailConnection, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, owner_id, account_email_hash,
-		account_email_ciphertext, account_email_iv, account_email_tag, account_email_key_version,
-		scope, state, refresh_token_ciphertext, refresh_token_iv, refresh_token_tag,
-		refresh_token_key_version, watch_expires_at, history_cursor, sync_state, last_sync_at,
-		last_error_code, connected_at, updated_at
+	row := s.DB.QueryRowContext(ctx, `SELECT `+gmailConnectionColumns+`
 		FROM gmail_connections WHERE account_email_hash = ? AND state = 'ACTIVE'`, emailHash)
 	return s.scanGmailConnection(row)
 }
 
-func (s *Store) scanGmailConnection(row *sql.Row) (GmailConnection, error) {
+func (s *Store) scanGmailConnection(row rowScanner) (GmailConnection, error) {
 	var conn GmailConnection
 	var emailCipher, emailIV, emailTag []byte
 	var emailVersion int64
 	var refreshCipher, refreshIV, refreshTag []byte
 	var refreshVersion sql.NullInt64
-	var watchExpires, lastSync sql.NullString
+	var accessCipher, accessIV, accessTag []byte
+	var accessVersion sql.NullInt64
+	var watchExpires, lastSync, accessExpires sql.NullString
+	var lastAttempt, lastSuccess, syncRequested sql.NullString
 	var historyCursor, lastError sql.NullString
 	var connectedAt, updatedAt string
 	err := row.Scan(&conn.ID, &conn.OwnerID, &conn.AccountEmailHash, &emailCipher, &emailIV,
 		&emailTag, &emailVersion, &conn.Scope, &conn.State, &refreshCipher, &refreshIV,
 		&refreshTag, &refreshVersion, &watchExpires, &historyCursor, &conn.SyncState,
-		&lastSync, &lastError, &connectedAt, &updatedAt)
+		&lastSync, &lastError, &accessCipher, &accessIV, &accessTag, &accessVersion,
+		&accessExpires, &lastAttempt, &lastSuccess, &syncRequested, &connectedAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return GmailConnection{}, ErrGmailNotConnected
 	}
@@ -302,11 +315,30 @@ func (s *Store) scanGmailConnection(row *sql.Row) (GmailConnection, error) {
 			return GmailConnection{}, err
 		}
 	}
+	if accessVersion.Valid && len(accessCipher) > 0 {
+		conn.AccessToken, err = s.openGmailValue(conn.OwnerID, gmailPurposeAccess,
+			accessCipher, accessIV, accessTag, accessVersion.Int64)
+		if err != nil {
+			return GmailConnection{}, err
+		}
+	}
 	if watchExpires.Valid {
 		conn.WatchExpiresAt = parseTime(watchExpires.String)
 	}
+	if accessExpires.Valid {
+		conn.AccessTokenExpiresAt = parseTime(accessExpires.String)
+	}
 	if lastSync.Valid {
 		conn.LastSyncAt = parseTime(lastSync.String)
+	}
+	if lastAttempt.Valid {
+		conn.LastAttemptAt = parseTime(lastAttempt.String)
+	}
+	if lastSuccess.Valid {
+		conn.LastSuccessAt = parseTime(lastSuccess.String)
+	}
+	if syncRequested.Valid {
+		conn.SyncRequestedAt = parseTime(syncRequested.String)
 	}
 	conn.HistoryCursor = historyCursor.String
 	conn.LastErrorCode = lastError.String
@@ -348,6 +380,93 @@ func (s *Store) UpdateGmailSyncState(ctx context.Context, ownerID, syncState, hi
 	return err
 }
 
+// UpdateGmailAccessToken caches the short-lived Google token (sealed) next to the connection so
+// the worker does not refresh it on every provider call. An empty token clears the cache.
+func (s *Store) UpdateGmailAccessToken(ctx context.Context, ownerID, accessToken string,
+	expiresAt, now time.Time) error {
+	if accessToken == "" {
+		_, err := s.DB.ExecContext(ctx, `UPDATE gmail_connections
+			SET access_token_ciphertext = NULL, access_token_iv = NULL, access_token_tag = NULL,
+				access_token_key_version = NULL, access_token_expires_at = NULL, updated_at = ?
+			WHERE owner_id = ? AND state = 'ACTIVE'`, nowString(now), ownerID)
+		return err
+	}
+	sealed, err := s.sealGmailValue(ownerID, gmailPurposeAccess, accessToken)
+	if err != nil {
+		return err
+	}
+	res, err := s.DB.ExecContext(ctx, `UPDATE gmail_connections
+		SET access_token_ciphertext = ?, access_token_iv = ?, access_token_tag = ?,
+			access_token_key_version = ?, access_token_expires_at = ?, updated_at = ?
+		WHERE owner_id = ? AND state = 'ACTIVE'`,
+		sealed.Ciphertext, sealed.IV, sealed.Tag, sealed.KeyVersion,
+		nullableTimeString(expiresAt), nowString(now), ownerID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return ErrGmailNotConnected
+	}
+	return nil
+}
+
+// RecordGmailAttempt stamps the start of a sync unit. next_sync_at in the status response is
+// derived from it, so the 15-minute delta cadence survives a restart without a timer table.
+func (s *Store) RecordGmailAttempt(ctx context.Context, ownerID string, now time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE gmail_connections
+		SET last_attempt_at = ?, updated_at = ?
+		WHERE owner_id = ? AND state = 'ACTIVE'`, nowString(now), nowString(now), ownerID)
+	return err
+}
+
+// RecordGmailSuccess stamps a completed unit and clears the last error code.
+func (s *Store) RecordGmailSuccess(ctx context.Context, ownerID string, now time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE gmail_connections
+		SET last_success_at = ?, last_error_code = NULL, updated_at = ?
+		WHERE owner_id = ? AND state = 'ACTIVE'`, nowString(now), nowString(now), ownerID)
+	return err
+}
+
+// RequestGmailSync writes the durable manual-sync marker unless the cooldown is still active. It
+// returns the request timestamp (or the earlier one when throttled) and whether this call queued.
+func (s *Store) RequestGmailSync(ctx context.Context, ownerID string, cooldown time.Duration,
+	now time.Time) (time.Time, bool, error) {
+	if cooldown < 0 {
+		cooldown = 0
+	}
+	cutoff := now.Add(-cooldown)
+	res, err := s.DB.ExecContext(ctx, `UPDATE gmail_connections
+		SET sync_requested_at = ?, updated_at = ?
+		WHERE owner_id = ? AND state = 'ACTIVE'
+		  AND (sync_requested_at IS NULL OR sync_requested_at <= ?)`,
+		nowString(now), nowString(now), ownerID, nowString(cutoff))
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if affected, _ := res.RowsAffected(); affected == 1 {
+		return now, true, nil
+	}
+	connection, err := s.GetGmailConnection(ctx, ownerID)
+	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, ErrGmailNotConnected) {
+		return time.Time{}, false, ErrGmailNotConnected
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return connection.SyncRequestedAt, false, nil
+}
+
+// RequeueGmailSyncJob keeps a job open after a retryable provider failure (rate limit, 5xx) so
+// the next worker tick resumes the same checkpoint instead of losing the batch.
+func (s *Store) RequeueGmailSyncJob(ctx context.Context, ownerID, jobID, errorCode string,
+	now time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE gmail_sync_jobs
+		SET state = 'CREATED', last_error_code = ?, updated_at = ?
+		WHERE owner_id = ? AND id = ? AND state IN ('RUNNING', 'CREATED')`,
+		nullableString(errorCode), nowString(now), ownerID, jobID)
+	return err
+}
+
 // DisconnectGmail clears credentials and stops future work. Transaction data is retained.
 func (s *Store) DisconnectGmail(ctx context.Context, ownerID string, now time.Time) error {
 	res, err := s.DB.ExecContext(ctx, `UPDATE gmail_connections
@@ -370,11 +489,7 @@ func (s *Store) ListActiveGmailConnections(ctx context.Context, limit int) ([]Gm
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, owner_id, account_email_hash,
-		account_email_ciphertext, account_email_iv, account_email_tag, account_email_key_version,
-		scope, state, refresh_token_ciphertext, refresh_token_iv, refresh_token_tag,
-		refresh_token_key_version, watch_expires_at, history_cursor, sync_state, last_sync_at,
-		last_error_code, connected_at, updated_at
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+gmailConnectionColumns+`
 		FROM gmail_connections WHERE state = 'ACTIVE' ORDER BY updated_at ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -382,42 +497,10 @@ func (s *Store) ListActiveGmailConnections(ctx context.Context, limit int) ([]Gm
 	defer rows.Close()
 	connections := make([]GmailConnection, 0, limit)
 	for rows.Next() {
-		var conn GmailConnection
-		var emailCipher, emailIV, emailTag []byte
-		var emailVersion int64
-		var refreshCipher, refreshIV, refreshTag []byte
-		var refreshVersion sql.NullInt64
-		var watchExpires, lastSync sql.NullString
-		var historyCursor, lastError sql.NullString
-		var connectedAt, updatedAt string
-		if err := rows.Scan(&conn.ID, &conn.OwnerID, &conn.AccountEmailHash, &emailCipher,
-			&emailIV, &emailTag, &emailVersion, &conn.Scope, &conn.State, &refreshCipher,
-			&refreshIV, &refreshTag, &refreshVersion, &watchExpires, &historyCursor,
-			&conn.SyncState, &lastSync, &lastError, &connectedAt, &updatedAt); err != nil {
-			return nil, err
-		}
-		conn.AccountEmail, err = s.openGmailValue(conn.OwnerID, gmailPurposeEmail, emailCipher,
-			emailIV, emailTag, emailVersion)
+		conn, err := s.scanGmailConnection(rows)
 		if err != nil {
 			return nil, err
 		}
-		if refreshVersion.Valid && len(refreshCipher) > 0 {
-			conn.RefreshToken, err = s.openGmailValue(conn.OwnerID, gmailPurposeRefresh,
-				refreshCipher, refreshIV, refreshTag, refreshVersion.Int64)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if watchExpires.Valid {
-			conn.WatchExpiresAt = parseTime(watchExpires.String)
-		}
-		if lastSync.Valid {
-			conn.LastSyncAt = parseTime(lastSync.String)
-		}
-		conn.HistoryCursor = historyCursor.String
-		conn.LastErrorCode = lastError.String
-		conn.ConnectedAt = parseTime(connectedAt)
-		conn.UpdatedAt = parseTime(updatedAt)
 		connections = append(connections, conn)
 	}
 	return connections, rows.Err()
@@ -505,6 +588,12 @@ func (s *Store) FinishGmailPushEvent(ctx context.Context, eventID, state, errorC
 	return err
 }
 
+// gmailSyncJobColumns keeps the job readers aligned with migration 020's pages_done counter.
+const gmailSyncJobColumns = `id, owner_id, kind, COALESCE(month_id, ''), state,
+	period_start, period_end, page_token_ciphertext, page_token_iv, page_token_tag,
+	page_token_key_version, seen_count, imported_count, duplicate_count, skipped_count,
+	attempts, last_error_code, pages_done`
+
 // GmailSyncJob is one checkpointed backfill month or delta batch.
 type GmailSyncJob struct {
 	ID            string
@@ -520,6 +609,7 @@ type GmailSyncJob struct {
 	Duplicates    int
 	Skipped       int
 	Attempts      int
+	PagesDone     int
 	LastErrorCode string
 }
 
@@ -558,10 +648,7 @@ func (s *Store) EnsureGmailBackfillJob(ctx context.Context, ownerID, monthID str
 
 // OpenGmailDeltaJob returns the in-flight delta job, if any.
 func (s *Store) OpenGmailDeltaJob(ctx context.Context, ownerID string) (GmailSyncJob, bool, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, owner_id, kind, COALESCE(month_id, ''), state,
-		period_start, period_end, page_token_ciphertext, page_token_iv, page_token_tag,
-		page_token_key_version, seen_count, imported_count, duplicate_count, skipped_count,
-		attempts, last_error_code FROM gmail_sync_jobs
+	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = 'DELTA' AND state IN ('CREATED', 'RUNNING')
 		ORDER BY created_at DESC LIMIT 1`, ownerID)
 	job, err := s.scanGmailSyncJob(row)
@@ -577,10 +664,7 @@ func (s *Store) OpenGmailDeltaJob(ctx context.Context, ownerID string) (GmailSyn
 // EnsureGmailDeltaJob reuses one open delta job per owner, or creates one starting at cursor.
 func (s *Store) EnsureGmailDeltaJob(ctx context.Context, ownerID string, start, end time.Time,
 	now time.Time) (GmailSyncJob, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, owner_id, kind, COALESCE(month_id, ''), state,
-		period_start, period_end, page_token_ciphertext, page_token_iv, page_token_tag,
-		page_token_key_version, seen_count, imported_count, duplicate_count, skipped_count,
-		attempts, last_error_code FROM gmail_sync_jobs
+	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = 'DELTA' AND state IN ('CREATED', 'RUNNING')
 		ORDER BY created_at DESC LIMIT 1`, ownerID)
 	job, err := s.scanGmailSyncJob(row)
@@ -599,20 +683,14 @@ func (s *Store) EnsureGmailDeltaJob(ctx context.Context, ownerID string, start, 
 	if err != nil {
 		return GmailSyncJob{}, err
 	}
-	row = s.DB.QueryRowContext(ctx, `SELECT id, owner_id, kind, COALESCE(month_id, ''), state,
-		period_start, period_end, page_token_ciphertext, page_token_iv, page_token_tag,
-		page_token_key_version, seen_count, imported_count, duplicate_count, skipped_count,
-		attempts, last_error_code FROM gmail_sync_jobs
+	row = s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = 'DELTA' AND state IN ('CREATED', 'RUNNING')
 		ORDER BY created_at DESC LIMIT 1`, ownerID)
 	return s.scanGmailSyncJob(row)
 }
 
 func (s *Store) gmailSyncJob(ctx context.Context, ownerID, kind, monthID string) (GmailSyncJob, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, owner_id, kind, COALESCE(month_id, ''), state,
-		period_start, period_end, page_token_ciphertext, page_token_iv, page_token_tag,
-		page_token_key_version, seen_count, imported_count, duplicate_count, skipped_count,
-		attempts, last_error_code FROM gmail_sync_jobs
+	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = ? AND COALESCE(month_id, '') = ?`,
 		ownerID, kind, monthID)
 	return s.scanGmailSyncJob(row)
@@ -626,7 +704,7 @@ func (s *Store) scanGmailSyncJob(row *sql.Row) (GmailSyncJob, error) {
 	var lastError sql.NullString
 	err := row.Scan(&job.ID, &job.OwnerID, &job.Kind, &job.MonthID, &job.State, &periodStart,
 		&periodEnd, &pageCipher, &pageIV, &pageTag, &pageVersion, &job.Seen, &job.Imported,
-		&job.Duplicates, &job.Skipped, &job.Attempts, &lastError)
+		&job.Duplicates, &job.Skipped, &job.Attempts, &lastError, &job.PagesDone)
 	if err != nil {
 		return GmailSyncJob{}, err
 	}
@@ -656,10 +734,7 @@ func (s *Store) StartGmailSyncJob(ctx context.Context, ownerID, jobID string, no
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		return GmailSyncJob{}, ErrGmailJobNotOpen
 	}
-	row := s.DB.QueryRowContext(ctx, `SELECT id, owner_id, kind, COALESCE(month_id, ''), state,
-		period_start, period_end, page_token_ciphertext, page_token_iv, page_token_tag,
-		page_token_key_version, seen_count, imported_count, duplicate_count, skipped_count,
-		attempts, last_error_code FROM gmail_sync_jobs WHERE owner_id = ? AND id = ?`,
+	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs WHERE owner_id = ? AND id = ?`,
 		ownerID, jobID)
 	return s.scanGmailSyncJob(row)
 }
@@ -667,7 +742,7 @@ func (s *Store) StartGmailSyncJob(ctx context.Context, ownerID, jobID string, no
 // CheckpointGmailSyncJob persists the next page token only after the page was acknowledged by
 // the ingest layer, so a crash mid-page re-reads rather than skips notifications.
 func (s *Store) CheckpointGmailSyncJob(ctx context.Context, ownerID, jobID, pageToken string,
-	seen, imported, duplicates, skipped int, now time.Time) error {
+	seen, imported, duplicates, skipped, pagesDone int, now time.Time) error {
 	var sealed crypto.Sealed
 	var err error
 	if pageToken != "" {
@@ -679,10 +754,10 @@ func (s *Store) CheckpointGmailSyncJob(ctx context.Context, ownerID, jobID, page
 	_, err = s.DB.ExecContext(ctx, `UPDATE gmail_sync_jobs SET
 		page_token_ciphertext = ?, page_token_iv = ?, page_token_tag = ?,
 		page_token_key_version = ?, seen_count = ?, imported_count = ?, duplicate_count = ?,
-		skipped_count = ?, updated_at = ?
+		skipped_count = ?, pages_done = ?, updated_at = ?
 		WHERE owner_id = ? AND id = ? AND state = 'RUNNING'`,
 		nullableBytes(sealed.Ciphertext), nullableBytes(sealed.IV), nullableBytes(sealed.Tag),
-		nullableKeyVersion(sealed.KeyVersion), seen, imported, duplicates, skipped,
+		nullableKeyVersion(sealed.KeyVersion), seen, imported, duplicates, skipped, pagesDone,
 		nowString(now), ownerID, jobID)
 	return err
 }

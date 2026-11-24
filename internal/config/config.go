@@ -94,7 +94,10 @@ type CategoryLLM struct {
 // Gmail is the Gmail API integration policy. It is disabled by default so a backend without
 // Google Cloud credentials still runs every other feature.
 type Gmail struct {
-	Enabled            bool
+	Enabled bool
+	// Mode selects the transport. "polling" (default) runs OAuth, backfill and delta without
+	// Pub/Sub; "push" is the opt-in rollback that keeps the old watch + Pub/Sub behaviour.
+	Mode               string
 	ClientID           string
 	ClientSecret       string
 	RedirectURI        string
@@ -113,6 +116,19 @@ type Gmail struct {
 	WorkerInterval     time.Duration
 	PageSize           int
 	MaxPagesPerRun     int
+	// DeltaInterval is the minimum automatic delta cadence per owner (contract §9.4: 900 s).
+	DeltaInterval time.Duration
+	// SyncCooldown throttles manual POST /v1/gmail/sync requests from the same owner.
+	SyncCooldown time.Duration
+	// AllowLoopbackRedirect permits the exact local Android UAT callback over HTTP. It is only
+	// honoured for APP_ENV=development/uat-local and host 127.0.0.1.
+	AllowLoopbackRedirect bool
+	// Provider selects the Gmail adapter: "google" (real API) or "fake" (dev/UAT fixture only).
+	Provider string
+	// DevFixtureFile is the JSON fixture served by the fake provider. Dev-only, outside the repo.
+	DevFixtureFile string
+	// DevScenario selects the fake provider script: normal, history_expired or rate_limit.
+	DevScenario string
 }
 
 // Retention controls the scheduled CR-005 cleanup. Both switches default to off: the server never
@@ -135,6 +151,30 @@ type Limits struct {
 }
 
 // Load parses env. It returns an error for invalid values and production-unsafe secrets.
+// gmailCallbackPath is the only HTTP-clearable callback path (local Android UAT loopback).
+const gmailCallbackPath = "/v1/gmail/connect/callback"
+
+// gmailRedirectURIProblem validates GMAIL_REDIRECT_URI and returns "" when it is acceptable.
+func gmailRedirectURIProblem(cfg *Config) string {
+	parsed, err := url.Parse(cfg.Gmail.RedirectURI)
+	if err != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		parsed.User != nil {
+		return "GMAIL_REDIRECT_URI must be an absolute URL without credentials, query or fragment"
+	}
+	if parsed.Scheme == "https" {
+		return ""
+	}
+	loopbackProfile := cfg.Env == "development" || cfg.Env == "uat-local"
+	if parsed.Scheme == "http" && loopbackProfile && cfg.Gmail.AllowLoopbackRedirect &&
+		parsed.Hostname() == "127.0.0.1" && parsed.Path == gmailCallbackPath {
+		// Port intentionally not pinned: the UAT profile uses 18090, the QA harness uses an
+		// ephemeral port. No wildcard host/path and no public HTTP callback is accepted.
+		return ""
+	}
+	return "GMAIL_REDIRECT_URI must be HTTPS (HTTP is allowed only for APP_ENV=development/uat-local " +
+		"with GMAIL_ALLOW_LOOPBACK_REDIRECT=true, host 127.0.0.1 and path " + gmailCallbackPath + ")"
+}
+
 func Load(env map[string]string) (*Config, error) {
 	if env == nil {
 		env = environ()
@@ -183,25 +223,32 @@ func Load(env map[string]string) (*Config, error) {
 			CompletionPer1K:    floatValue(env, "CATEGORY_LLM_PRICE_COMPLETION_PER_1K_USD", 0),
 		},
 		Gmail: Gmail{
-			Enabled:            boolValue(env, "GMAIL_ENABLED", false),
-			ClientID:           get(env, "GMAIL_CLIENT_ID", ""),
-			ClientSecret:       get(env, "GMAIL_CLIENT_SECRET", ""),
-			RedirectURI:        get(env, "GMAIL_REDIRECT_URI", ""),
-			TopicName:          get(env, "GMAIL_PUBSUB_TOPIC", ""),
-			PushAudience:       get(env, "GMAIL_PUSH_AUDIENCE", ""),
-			PushServiceAccount: get(env, "GMAIL_PUSH_SERVICE_ACCOUNT", ""),
-			AppDeepLink:        get(env, "GMAIL_APP_DEEP_LINK", "pam://gmail/connected"),
-			AuthURL:            get(env, "GMAIL_AUTH_URL", "https://accounts.google.com/o/oauth2/v2/auth"),
-			TokenURL:           get(env, "GMAIL_TOKEN_URL", "https://oauth2.googleapis.com/token"),
-			RevokeURL:          get(env, "GMAIL_REVOKE_URL", "https://oauth2.googleapis.com/revoke"),
-			JWKSURL:            get(env, "GMAIL_JWKS_URL", "https://www.googleapis.com/oauth2/v3/certs"),
-			Scope:              get(env, "GMAIL_SCOPE", "https://www.googleapis.com/auth/gmail.readonly"),
-			StateTTL:           time.Duration(intValue(env, "GMAIL_STATE_TTL_SECONDS", 600)) * time.Second,
-			BackfillMonths:     intValue(env, "GMAIL_BACKFILL_MONTHS", 12),
-			WatchRenewBefore:   time.Duration(intValue(env, "GMAIL_WATCH_RENEW_BEFORE_HOURS", 24)) * time.Hour,
-			WorkerInterval:     time.Duration(intValue(env, "GMAIL_WORKER_INTERVAL_SECONDS", 60)) * time.Second,
-			PageSize:           intValue(env, "GMAIL_PAGE_SIZE", 50),
-			MaxPagesPerRun:     intValue(env, "GMAIL_MAX_PAGES_PER_RUN", 5),
+			Enabled:               boolValue(env, "GMAIL_ENABLED", false),
+			Mode:                  strings.ToLower(get(env, "GMAIL_MODE", "polling")),
+			Provider:              strings.ToLower(get(env, "GMAIL_PROVIDER", "google")),
+			ClientID:              get(env, "GMAIL_CLIENT_ID", ""),
+			ClientSecret:          get(env, "GMAIL_CLIENT_SECRET", ""),
+			RedirectURI:           get(env, "GMAIL_REDIRECT_URI", ""),
+			TopicName:             get(env, "GMAIL_PUBSUB_TOPIC", ""),
+			PushAudience:          get(env, "GMAIL_PUSH_AUDIENCE", ""),
+			PushServiceAccount:    get(env, "GMAIL_PUSH_SERVICE_ACCOUNT", ""),
+			AppDeepLink:           get(env, "GMAIL_APP_DEEP_LINK", "pam://gmail/connected"),
+			AuthURL:               get(env, "GMAIL_AUTH_URL", "https://accounts.google.com/o/oauth2/v2/auth"),
+			TokenURL:              get(env, "GMAIL_TOKEN_URL", "https://oauth2.googleapis.com/token"),
+			RevokeURL:             get(env, "GMAIL_REVOKE_URL", "https://oauth2.googleapis.com/revoke"),
+			JWKSURL:               get(env, "GMAIL_JWKS_URL", "https://www.googleapis.com/oauth2/v3/certs"),
+			Scope:                 get(env, "GMAIL_SCOPE", "https://www.googleapis.com/auth/gmail.readonly"),
+			StateTTL:              time.Duration(intValue(env, "GMAIL_STATE_TTL_SECONDS", 600)) * time.Second,
+			BackfillMonths:        intValue(env, "GMAIL_BACKFILL_MONTHS", 12),
+			WatchRenewBefore:      time.Duration(intValue(env, "GMAIL_WATCH_RENEW_BEFORE_HOURS", 24)) * time.Hour,
+			WorkerInterval:        time.Duration(intValue(env, "GMAIL_WORKER_INTERVAL_SECONDS", 60)) * time.Second,
+			PageSize:              intValue(env, "GMAIL_PAGE_SIZE", 50),
+			MaxPagesPerRun:        intValue(env, "GMAIL_MAX_PAGES_PER_RUN", 5),
+			DeltaInterval:         time.Duration(intValue(env, "GMAIL_DELTA_INTERVAL_SECONDS", 900)) * time.Second,
+			SyncCooldown:          time.Duration(intValue(env, "GMAIL_SYNC_COOLDOWN_SECONDS", 60)) * time.Second,
+			AllowLoopbackRedirect: boolValue(env, "GMAIL_ALLOW_LOOPBACK_REDIRECT", false),
+			DevFixtureFile:        get(env, "GMAIL_DEV_FIXTURE_FILE", ""),
+			DevScenario:           strings.ToLower(get(env, "GMAIL_DEV_SCENARIO", "normal")),
 		},
 		Retention: Retention{
 			SweepEnabled:  boolValue(env, "RETENTION_SWEEP_ENABLED", false),
@@ -275,21 +322,54 @@ func Load(env map[string]string) (*Config, error) {
 	}
 	if cfg.Gmail.Enabled {
 		problems := []string{}
+		if cfg.Gmail.Mode != "polling" && cfg.Gmail.Mode != "push" {
+			problems = append(problems, "GMAIL_MODE must be polling or push")
+		}
+		if cfg.Gmail.Provider != "google" && cfg.Gmail.Provider != "fake" {
+			problems = append(problems, "GMAIL_PROVIDER must be google or fake")
+		}
 		if cfg.Gmail.ClientID == "" || cfg.Gmail.ClientSecret == "" {
 			problems = append(problems, "GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET are required when GMAIL_ENABLED=true")
 		}
-		if parsed, err := url.Parse(cfg.Gmail.RedirectURI); err != nil || parsed.Scheme != "https" ||
-			parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-			problems = append(problems, "GMAIL_REDIRECT_URI must be an HTTPS URL without query or fragment")
+		// The OAuth callback is HTTPS in every profile. The single exception is the local Android
+		// UAT loopback: HTTP, APP_ENV development/uat-local, explicit flag, host exactly 127.0.0.1
+		// and the exact callback path. The port is free so the QA harness can use an ephemeral one.
+		if redirectProblem := gmailRedirectURIProblem(cfg); redirectProblem != "" {
+			problems = append(problems, redirectProblem)
 		}
-		if cfg.Gmail.TopicName == "" {
-			problems = append(problems, "GMAIL_PUBSUB_TOPIC is required when GMAIL_ENABLED=true")
+		// Pub/Sub settings are only needed by the opt-in push mode. In polling mode they are
+		// ignored (and may stay empty) so a zero-cost deployment starts without Google Cloud.
+		if cfg.Gmail.Mode == "push" {
+			if cfg.Gmail.TopicName == "" {
+				problems = append(problems, "GMAIL_PUBSUB_TOPIC is required when GMAIL_MODE=push")
+			}
+			if cfg.Gmail.PushAudience == "" || cfg.Gmail.PushServiceAccount == "" {
+				problems = append(problems, "GMAIL_PUSH_AUDIENCE and GMAIL_PUSH_SERVICE_ACCOUNT are required when GMAIL_MODE=push")
+			}
 		}
-		if cfg.Gmail.PushAudience == "" || cfg.Gmail.PushServiceAccount == "" {
-			problems = append(problems, "GMAIL_PUSH_AUDIENCE and GMAIL_PUSH_SERVICE_ACCOUNT are required when GMAIL_ENABLED=true")
+		// The fake provider is a development/UAT fixture only; it must never be reachable from a
+		// production profile even if every other flag is set.
+		if cfg.Gmail.Provider == "fake" {
+			if cfg.Env != "development" {
+				problems = append(problems, "GMAIL_PROVIDER=fake is only allowed when APP_ENV=development")
+			}
+			if !cfg.Gmail.AllowLoopbackRedirect {
+				problems = append(problems, "GMAIL_PROVIDER=fake requires GMAIL_ALLOW_LOOPBACK_REDIRECT=true")
+			}
+			if cfg.Gmail.DevFixtureFile == "" {
+				problems = append(problems, "GMAIL_DEV_FIXTURE_FILE is required when GMAIL_PROVIDER=fake")
+			}
+			if cfg.Gmail.DevScenario != "normal" && cfg.Gmail.DevScenario != "history_expired" &&
+				cfg.Gmail.DevScenario != "rate_limit" {
+				problems = append(problems, "GMAIL_DEV_SCENARIO must be normal, history_expired or rate_limit")
+			}
 		}
 		if len(problems) > 0 {
 			return nil, fmt.Errorf("invalid Gmail configuration: %s", strings.Join(problems, "; "))
+		}
+		if cfg.Gmail.Mode == "polling" && cfg.Gmail.TopicName != "" {
+			cfg.Warnings = append(cfg.Warnings,
+				"GMAIL_MODE=polling ignores GMAIL_PUBSUB_TOPIC/GMAIL_PUSH_*; set GMAIL_MODE=push to re-enable")
 		}
 	}
 	if cfg.Env == "production" {
