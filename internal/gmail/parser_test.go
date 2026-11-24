@@ -347,3 +347,201 @@ func TestParseLivinShortIndonesianMonths(t *testing.T) {
 		})
 	}
 }
+
+// The inline "Penerima: value" path must apply the same field-value guard as the stacked path;
+// otherwise an amount/date/reference prints as the merchant label.
+func TestParseLivinInlineLabelRejectsFieldLines(t *testing.T) {
+	for _, inlineValue := range []string{
+		"Nominal Transaksi Rp 25.000,00",
+		"24 Nov 2026",
+		"No. Referensi ABC123XYZ",
+	} {
+		t.Run(inlineValue, func(t *testing.T) {
+			body := `Pembayaran Berhasil
+
+Penerima: ` + inlineValue + `
+Jumlah: Rp 25.000
+Tanggal: 10 Nov 2026 09:30:45
+`
+			parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+			if parsed.Status == "PARSED" {
+				t.Fatalf("inline field %q must not become a merchant label: %+v", inlineValue, parsed)
+			}
+			if parsed.MerchantLabel != "" {
+				t.Fatalf("merchant label = %q, want empty", parsed.MerchantLabel)
+			}
+		})
+	}
+}
+
+// A business name may legitimately contain a month word and a street number; the guard must not
+// turn it into merchant_missing.
+func TestParseLivinMerchantWithMonthAndStreetNumber(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+TOKO MAJU 88 MEI
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+pkl 09:30:45 WIB
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status != "PARSED" {
+		t.Fatalf("business name with month word must parse: %+v", parsed)
+	}
+	if parsed.MerchantLabel != "TOKO MAJU 88 MEI" {
+		t.Fatalf("merchant = %q", parsed.MerchantLabel)
+	}
+}
+
+// Some templates print the zone marker on its own line after the time.
+func TestParseLivinSeparateZoneLine(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+pkl 09:30:45
+WITA
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status != "PARSED" {
+		t.Fatalf("separate zone line must parse: %+v", parsed)
+	}
+	want := time.Date(2026, 11, 24, 9, 30, 45, 0, wita)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+}
+
+// A time of day printed in the body two lines after the date but separated by ordinary prose
+// (not a field line) must not be bound to the transaction.
+func TestParseLivinIgnoresDistantTime(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+Promo berlaku hingga
+23:59
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status != "PARSED" {
+		t.Fatalf("date-only template must still parse: %+v", parsed)
+	}
+	want := time.Date(2026, 11, 24, 0, 0, 0, 0, jakarta)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want date-only %s", parsed.EventAt, want)
+	}
+}
+
+// A decorative divider between a stacked label and its value must not hide the merchant.
+func TestParseLivinBareLabelSkipsSeparatorLine(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+------
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+pkl 09:30:45 WIB
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status != "PARSED" {
+		t.Fatalf("separator line must not break parsing: %+v", parsed)
+	}
+	if parsed.MerchantLabel != "WARUNG SEDERHANA" {
+		t.Fatalf("merchant = %q", parsed.MerchantLabel)
+	}
+}
+
+// PAN/reference lines stacked under a business-name label must never be stored as the merchant.
+func TestParseLivinStackedLabelRejectsPANAndFieldLines(t *testing.T) {
+	for _, nextLine := range []string{
+		"Merchant PAN: 936009110000123456",
+		"Customer PAN: 936000110000654321",
+		"Nomor Kartu 936009110000123456",
+		"ID Transaksi 202611100001234567",
+		"150.000,00",
+	} {
+		t.Run(nextLine, func(t *testing.T) {
+			body := `Pembayaran Berhasil
+
+Penerima
+` + nextLine + `
+
+Jumlah: Rp 25.000
+Tanggal: 10 Nov 2026 09:30:45
+`
+			parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+			if parsed.Status == "PARSED" {
+				t.Fatalf("field/PAN line %q must not become a merchant label: %+v", nextLine, parsed)
+			}
+			if parsed.MerchantLabel != "" {
+				t.Fatalf("merchant label = %q, want empty", parsed.MerchantLabel)
+			}
+		})
+	}
+}
+
+func TestParseLivinInlineLabelRejectsPANLine(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima: Merchant PAN: 936009110000123456
+Jumlah: Rp 25.000
+Tanggal: 10 Nov 2026 09:30:45
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status == "PARSED" || parsed.MerchantLabel != "" {
+		t.Fatalf("inline PAN field must not become a merchant: %+v", parsed)
+	}
+}
+
+// A business name may contain a short month word without a year ("Warung Bu Des 2").
+func TestParseLivinMerchantWithShortMonthWord(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+Warung Bu Des 2
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+pkl 09:30:45 WIB
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status != "PARSED" {
+		t.Fatalf("merchant with month word must parse: %+v", parsed)
+	}
+	if parsed.MerchantLabel != "Warung Bu Des 2" {
+		t.Fatalf("merchant = %q", parsed.MerchantLabel)
+	}
+}
+
+// Three field lines between the date and the time must still be crossed (production template).
+func TestParseLivinTimeAcrossThreeFieldLines(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+No. Referensi ABC123XYZ
+Merchant PAN: 936009110000123456
+pkl 09:30:45 WIB
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status != "PARSED" {
+		t.Fatalf("three intervening field lines must parse: %+v", parsed)
+	}
+	want := time.Date(2026, 11, 24, 9, 30, 45, 0, jakarta)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+}

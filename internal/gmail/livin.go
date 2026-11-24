@@ -65,6 +65,15 @@ var (
 	// timezoneTokenPattern identifies the WIB/WITA/WIT marker printed after the time. WITA and WIT
 	// carry real offsets, so the marker selects the location instead of being silently dropped.
 	timezoneTokenPattern = regexp.MustCompile(`(?i)\b(WITA|WIT|WIB)\b`)
+	// yearPattern distinguishes a real date ("24 Nov 2026") from a merchant that happens to
+	// contain a month word and a street number.
+	yearPattern = regexp.MustCompile(`\b(?:19|20)\d{2}\b`)
+	// fieldLabelPattern matches a generic "Some Field: value" line. Production templates stack
+	// labels like "Merchant PAN: 9360..." directly under the business-name label; such a line must
+	// never become a merchant name.
+	fieldLabelPattern = regexp.MustCompile(`(?i)^[a-z][a-z .]{0,28}:`)
+	// longIdentifierPattern catches PAN/reference numbers printed as one token ("936009110000123456").
+	longIdentifierPattern = regexp.MustCompile(`\d{6,}`)
 	// bareTimePattern catches a time-only next line ("pkl 09:30:45", "09:30") before the date pair
 	// logic gets a chance to join it with the date.
 	bareTimePattern = regexp.MustCompile(`(?i)^(?:pkl|pukul|waktu|jam)?\.?\s*\d{1,2}[:.]\d{2}`)
@@ -186,13 +195,21 @@ func findLabel(lines []string, reference string) string {
 		if match := labelKeyPattern.FindStringSubmatch(line); match != nil {
 			key = strings.ToLower(strings.TrimSpace(match[1]))
 			value = strings.TrimSpace(match[2])
+			if looksLikeFieldValue(value) {
+				continue
+			}
 		} else if match := labelBarePattern.FindStringSubmatch(line); match != nil {
 			key = strings.ToLower(strings.TrimSpace(match[1]))
-			if index+1 < len(lines) {
-				value = strings.TrimSpace(lines[index+1])
-				if looksLikeFieldValue(value) {
+			for offset := 1; offset <= 2 && index+offset < len(lines); offset++ {
+				candidate := strings.TrimSpace(lines[index+offset])
+				if isSeparatorLine(candidate) {
 					continue
 				}
+				value = candidate
+				break
+			}
+			if looksLikeFieldValue(value) {
+				continue
 			}
 		}
 		if key == "" {
@@ -230,7 +247,7 @@ func isIdentifierLabel(value string) bool {
 		switch {
 		case r >= '0' && r <= '9':
 			digits++
-		case r == ' ' || r == '-' || r == '.' || r == '/' || r == ':':
+		case r == ' ' || r == '-' || r == '.' || r == '/' || r == ':' || r == ',':
 		default:
 			return false
 		}
@@ -249,10 +266,19 @@ func looksLikeFieldValue(value string) bool {
 	// Field lines start with a known label word; a real business name practically never does.
 	for _, prefix := range []string{"nominal", "tanggal", "tgl", "waktu", "pukul", "pkl", "saldo",
 		"jumlah", "no. referensi", "no. ref", "nomor referensi", "referensi", "ref.", "reference",
-		"transaction date", "amount", "total pembayaran"} {
+		"transaction date", "amount", "total pembayaran", "merchant pan", "customer pan",
+		"no. kartu", "nomor kartu", "pan", "kode referensi", "id transaksi", "transaction id"} {
 		if strings.HasPrefix(lower, prefix) {
 			return true
 		}
+	}
+	// A generic "Label: value" line is another email field, not a business name.
+	if fieldLabelPattern.MatchString(lower) {
+		return true
+	}
+	// A single long digit token is a PAN/reference; business names never contain one.
+	if longIdentifierPattern.MatchString(value) {
+		return true
 	}
 	if amountPattern.MatchString(value) || standaloneAmountPattern.MatchString(value) {
 		return true
@@ -263,11 +289,29 @@ func looksLikeFieldValue(value string) bool {
 	if bareTimePattern.MatchString(value) {
 		return true
 	}
-	// A date-looking value carries a month token plus digits ("24 Nov 2026").
-	if indonesianMonths.MatchString(value) && strings.ContainsAny(value, "0123456789") {
+	// A date-looking value carries a month token plus a four-digit year ("24 Nov 2026").
+	// A month word next to a street number ("TOKO MAJU 88 MEI") is a business name, not a date.
+	if indonesianMonths.MatchString(value) && yearPattern.MatchString(value) {
 		return true
 	}
 	return false
+}
+
+// isSeparatorLine reports a decorative divider ("------", "=====") printed between a stacked
+// label and its value in some Livin templates.
+func isSeparatorLine(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		switch r {
+		case '-', '_', '=', '.', ':', '*', '~', ' ':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func findAmount(lines []string) (int64, bool) {
@@ -346,8 +390,27 @@ func findEventAt(lines []string) (time.Time, bool) {
 	// time-of-day; a date-only fallback is kept so a date without a printed time still parses.
 	var dateOnly time.Time
 	haveDateOnly := false
-	consider := func(raw string) (time.Time, bool, bool) {
+	// nearestZone picks a WIB/WITA/WIT marker within two lines of the date; some templates print
+	// the zone on its own line, so it would be ignored by parseDateValue otherwise.
+	nearestZone := func(index int) string {
+		for offset := 0; offset <= 2; offset++ {
+			for _, candidate := range []int{index + offset, index - offset} {
+				if candidate < 0 || candidate >= len(lines) {
+					continue
+				}
+				if match := timezoneTokenPattern.FindStringSubmatch(lines[candidate]); match != nil {
+					return strings.ToUpper(match[1])
+				}
+			}
+		}
+		return ""
+	}
+	consider := func(raw string, zone string) (time.Time, bool, bool) {
 		parsed, ok := parseDateValue(raw)
+		if ok && zone != "" && timezoneTokenPattern.MatchString(raw) == false {
+			// The zone lives on a neighbouring line; replay the parse with it appended.
+			parsed, ok = parseDateValue(raw + " " + zone)
+		}
 		if !ok {
 			return time.Time{}, false, false
 		}
@@ -358,19 +421,40 @@ func findEventAt(lines []string) (time.Time, bool) {
 		return parsed, true, timed
 	}
 	for index := range lines {
-		if parsed, ok, timed := consider(lines[index]); ok && timed {
+		zone := nearestZone(index)
+		if parsed, ok, timed := consider(lines[index], zone); ok && timed {
 			return parsed, true
 		}
-		for _, offset := range []int{1, -1, 2, -2} {
+		for _, offset := range []int{1, -1, 2, -2, 3, -3} {
 			neighbour := index + offset
 			if neighbour < 0 || neighbour >= len(lines) {
 				continue
+			}
+			if offset > 1 || offset < -1 {
+				// Only reach across intervening lines when every one is a field/separator line: the
+				// production template prints "Tanggal", then reference/amount lines, then
+				// "pkl ...". Ordinary prose must not bind an unrelated time of day.
+				step := 1
+				if offset < 0 {
+					step = -1
+				}
+				ok := true
+				for middle := index + step; middle != neighbour; middle += step {
+					line := strings.TrimSpace(lines[middle])
+					if !looksLikeFieldValue(line) && !isSeparatorLine(line) {
+						ok = false
+						break
+					}
+				}
+				if !ok {
+					continue
+				}
 			}
 			joined := lines[index] + " " + lines[neighbour]
 			if len(strings.Fields(joined)) < 3 {
 				continue
 			}
-			if parsed, ok, timed := consider(joined); ok && timed {
+			if parsed, ok, timed := consider(joined, zone); ok && timed {
 				return parsed, true
 			}
 		}
