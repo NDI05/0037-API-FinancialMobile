@@ -290,7 +290,11 @@ func ParseClientPayload(raw json.RawMessage) (ClientPayload, error) {
 	if payload.SchemaVersion != 1 {
 		return ClientPayload{}, fmt.Errorf("payload.schemaVersion must be 1")
 	}
-	if payload.Coverage != "COMPLETE" && payload.Coverage != "PARTIAL" && payload.Coverage != "UNKNOWN" {
+	// Coverage must mirror the summary domain enum (COMPLETE|PARTIAL|EMPTY|FAILED) so the app can
+	// forward GET /v1/summaries coverage verbatim; UNKNOWN stays accepted for the legacy v0.3 envelope.
+	switch payload.Coverage {
+	case "COMPLETE", "PARTIAL", "EMPTY", "FAILED", "UNKNOWN":
+	default:
 		return ClientPayload{}, fmt.Errorf("payload.coverage is invalid")
 	}
 	if payload.GrossInflowMinor < -1_000_000_000_000_000 || payload.GrossInflowMinor > 1_000_000_000_000_000 ||

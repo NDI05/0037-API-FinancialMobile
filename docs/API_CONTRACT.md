@@ -416,6 +416,10 @@ Rotasi kunci hanya dengan migrasi re-fingerprint; kunci dihapus saat akun dihapu
   ledger tetap disimpan untuk recovery dan dapat menunjukkan pending/error.
 - `POST /v1/analyses` tetap memakai allowlist `AiAggregatePayload`; backend memeriksa consent,
   owner, revisi, dan payload sebelum provider. Tidak ada transaksi/merchant di payload.
+  `payload.coverage` menerima enum domain yang sama dengan summary —
+  `COMPLETE|PARTIAL|EMPTY|FAILED` — plus `UNKNOWN` untuk envelope legacy v0.3; nilai lain ditolak
+  `400 invalid_request` (`payload.coverage is invalid`) sebelum provider dipanggil. Bulan dengan
+  coverage `EMPTY`/`FAILED` tetap boleh menghasilkan analisis opsional sesuai keputusan produk.
 - `POST /v1/deletion-requests { "password": "...", "confirmation": "DELETE_WORKSPACE" }` memblokir impor/analisis selama `PENDING`; worker menghapus data
   aktif dan metadata lampiran; backup kedaluwarsa ≤30 hari.
 
