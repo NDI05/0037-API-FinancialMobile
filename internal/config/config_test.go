@@ -267,3 +267,55 @@ func TestGmailPollingModeDefaultsAndFakeGuard(t *testing.T) {
 		t.Fatal("fake provider must be rejected outside development")
 	}
 }
+
+func TestGoogleSSODefaultsAndValidation(t *testing.T) {
+	base := map[string]string{"APP_ENV": "development"}
+	cfg, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GoogleSSO.Enabled || cfg.GoogleSSO.NonceTTL != 10*time.Minute {
+		t.Fatalf("google sso defaults = %#v", cfg.GoogleSSO)
+	}
+
+	enabled := map[string]string{"APP_ENV": "development", "GOOGLE_SSO_ENABLED": "true"}
+	if _, err := Load(enabled); err == nil {
+		t.Fatal("enabled Google SSO without a client id was accepted")
+	}
+	enabled["GOOGLE_SSO_CLIENT_ID"] = "client.apps.googleusercontent.com"
+	cfg, err = Load(enabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GoogleSSO.JWKSURL != "https://www.googleapis.com/oauth2/v3/certs" {
+		t.Fatalf("default JWKS URL = %q", cfg.GoogleSSO.JWKSURL)
+	}
+
+	ttl := map[string]string{"APP_ENV": "development", "GOOGLE_SSO_ENABLED": "true",
+		"GOOGLE_SSO_CLIENT_ID":         "client.apps.googleusercontent.com",
+		"GOOGLE_SSO_NONCE_TTL_SECONDS": "10"}
+	if _, err := Load(ttl); err == nil {
+		t.Fatal("nonce ttl below one minute was accepted")
+	}
+
+	// The JWKS override is a local-test seam: loopback http in development only.
+	local := map[string]string{"APP_ENV": "development", "GOOGLE_SSO_ENABLED": "true",
+		"GOOGLE_SSO_CLIENT_ID": "client.apps.googleusercontent.com",
+		"GOOGLE_SSO_JWKS_URL":  "http://127.0.0.1:18090/certs"}
+	if _, err := Load(local); err != nil {
+		t.Fatalf("development loopback JWKS rejected: %v", err)
+	}
+	local["APP_ENV"] = "production"
+	local["JWT_SECRET"] = "0123456789abcdef0123456789abcdef"
+	local["REFRESH_PEPPER"] = "abcdef0123456789abcdef0123456789"
+	local["DATA_ENCRYPTION_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	if _, err := Load(local); err == nil {
+		t.Fatal("production accepted an http JWKS override")
+	}
+	public := map[string]string{"APP_ENV": "development", "GOOGLE_SSO_ENABLED": "true",
+		"GOOGLE_SSO_CLIENT_ID": "client.apps.googleusercontent.com",
+		"GOOGLE_SSO_JWKS_URL":  "http://example.test/certs"}
+	if _, err := Load(public); err == nil {
+		t.Fatal("non-loopback http JWKS accepted in development")
+	}
+}

@@ -42,6 +42,7 @@ type Config struct {
 	LLM                LLM
 	CategoryLLM        CategoryLLM
 	Gmail              Gmail
+	GoogleSSO          GoogleSSO
 	Retention          Retention
 	Limits             Limits
 	Warnings           []string
@@ -130,6 +131,17 @@ type Gmail struct {
 	// DevScenario selects the fake provider script: normal, history_expired or rate_limit.
 	DevScenario string
 }
+
+// GoogleSSO configures the optional Google ID-token login. Only the Web Client ID is stored here:
+// the client secret is never needed for ID-token verification and stays exclusive to Gmail OAuth.
+type GoogleSSO struct {
+	Enabled  bool
+	ClientID string
+	JWKSURL  string
+	NonceTTL time.Duration
+}
+
+const defaultGoogleJWKSURL = "https://www.googleapis.com/oauth2/v3/certs"
 
 // Retention controls the scheduled CR-005 cleanup. Both switches default to off: the server never
 // scans or deletes financial data unless an operator explicitly turns it on. REPORT_ONLY is the
@@ -249,6 +261,12 @@ func Load(env map[string]string) (*Config, error) {
 			AllowLoopbackRedirect: boolValue(env, "GMAIL_ALLOW_LOOPBACK_REDIRECT", false),
 			DevFixtureFile:        get(env, "GMAIL_DEV_FIXTURE_FILE", ""),
 			DevScenario:           strings.ToLower(get(env, "GMAIL_DEV_SCENARIO", "normal")),
+		},
+		GoogleSSO: GoogleSSO{
+			Enabled:  boolValue(env, "GOOGLE_SSO_ENABLED", false),
+			ClientID: get(env, "GOOGLE_SSO_CLIENT_ID", ""),
+			JWKSURL:  get(env, "GOOGLE_SSO_JWKS_URL", ""),
+			NonceTTL: time.Duration(intValue(env, "GOOGLE_SSO_NONCE_TTL_SECONDS", 600)) * time.Second,
 		},
 		Retention: Retention{
 			SweepEnabled:  boolValue(env, "RETENTION_SWEEP_ENABLED", false),
@@ -370,6 +388,37 @@ func Load(env map[string]string) (*Config, error) {
 		if cfg.Gmail.Mode == "polling" && cfg.Gmail.TopicName != "" {
 			cfg.Warnings = append(cfg.Warnings,
 				"GMAIL_MODE=polling ignores GMAIL_PUBSUB_TOPIC/GMAIL_PUSH_*; set GMAIL_MODE=push to re-enable")
+		}
+	}
+	if cfg.GoogleSSO.Enabled {
+		problems := []string{}
+		if cfg.GoogleSSO.ClientID == "" {
+			problems = append(problems, "GOOGLE_SSO_CLIENT_ID is required when GOOGLE_SSO_ENABLED=true")
+		}
+		if cfg.GoogleSSO.NonceTTL < time.Minute || cfg.GoogleSSO.NonceTTL > time.Hour {
+			problems = append(problems, "GOOGLE_SSO_NONCE_TTL_SECONDS must be 60..3600")
+		}
+		jwksURL := cfg.GoogleSSO.JWKSURL
+		if jwksURL == "" {
+			jwksURL = defaultGoogleJWKSURL
+		}
+		parsed, err := url.Parse(jwksURL)
+		if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" ||
+			parsed.Fragment != "" {
+			problems = append(problems, "GOOGLE_SSO_JWKS_URL must be an absolute URL without credentials, query or fragment")
+		} else if parsed.Scheme != "https" {
+			// The JWKS override exists for local tests only. Outside development an http URL would
+			// let anyone inject signing keys, so it is refused even for loopback hosts.
+			loopback := parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1" ||
+				parsed.Hostname() == "localhost"
+			if cfg.Env != "development" || parsed.Scheme != "http" || !loopback {
+				problems = append(problems, "GOOGLE_SSO_JWKS_URL must be HTTPS (HTTP is allowed only for "+
+					"APP_ENV=development and a loopback host)")
+			}
+		}
+		cfg.GoogleSSO.JWKSURL = jwksURL
+		if len(problems) > 0 {
+			return nil, fmt.Errorf("invalid Google SSO configuration: %s", strings.Join(problems, "; "))
 		}
 	}
 	if cfg.Env == "production" {
