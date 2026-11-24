@@ -64,8 +64,11 @@ sama tidak pernah menggabungkan akun.
 - Env: `GOOGLE_SSO_ENABLED` (default `false`), `GOOGLE_SSO_CLIENT_ID` (Web Client ID, wajib bila
   aktif), `GOOGLE_SSO_JWKS_URL`, `GOOGLE_SSO_NONCE_TTL_SECONDS` — lihat [`.env.example`](.env.example).
 - Migrasi `021` menambah `google_identities` dan `google_sso_nonces`.
-- UAT akun Google nyata/Gmail live/gate Rp0 **NOT RUN (owner)**; unit/HTTP gate PASS di
-  `integration/2026-11-24` `71013f5`.
+- UAT akun Google nyata **NOT RUN (owner)**; **Gmail live sudah PASS untuk akun pilot owner**
+  (ratusan transaksi Livin nyata terimpor tanpa duplikat setelah perbaikan parser `5df6be6`/
+  `c98527b`; bukti agregat di repo Android
+  `pam-app/docs/evidence/GMAIL_LIVE_IMPORT_2026-11-24.md`). Gate **GCP Rp0 tetap OPEN**
+  (Billing masih tertaut); unit/HTTP gate PASS di `integration/2026-11-24`.
 
 ## Gmail API
 

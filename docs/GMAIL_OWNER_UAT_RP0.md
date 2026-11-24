@@ -101,6 +101,29 @@ judul OAuth palsu, database SQLite terpisah, dan `GMAIL_DEV_SCENARIO=normal`. Ca
    Ringkasan/Transaksi, jeda delta, dan hasil restart. Jangan pernah mencampur bukti ini dengan
    klaim Gmail live atau GCP Rp0.
 
+### 3b. UAT Gmail live akun pilot owner (24 November 2026, ronde 6)
+
+Backfill live pertama pada profil privat owner (`127.0.0.1:18090`, OAuth nyata, polling) memindai
+ratusan email Livin tetapi mengimpor **0 transaksi**. Penyebabnya bentuk produksi yang tidak
+dikenal parser fixture: label di **baris sendiri** (`Penerima` lalu nama penerima di baris
+berikutnya, tanpa titik dua) dan tanggal+waktu bertumpuk dengan **nama bulan Indonesia**
+(`12 Okt 2026` + `pkl 09:30:45 WIB`). Perbaikan: commit `5df6be6` (label/waktu stacked) dan
+`c98527b` (bulan Indonesia), diuji dengan regresi `TestParseLivinStacked*` dan
+`TestParseLivinIndonesianMonthAbbreviation`; `go vet/build/test ./... -count=1` + `-race`
+auth/gmail/httpapi/store **PASS**.
+
+Setelah runtime resmi dibangun ulang dari `c98527b` dan dijalankan ulang memakai launcher owner,
+impor live berjalan: ratusan transaksi Livin nyata tersimpan dengan **0 baris duplikat**
+(`source_ref_hash` semua unik), mis. Nov 40/54, Okt 53/86, Agu 55/124 pada snapshot 19:59 WIB dan
+backfill melanjutkan sampai 12/12. Rate limit Google ditangani backoff provider (tidak ada
+kegagalan permanen). Rincian agregat — tanpa alamat email, nominal, merchant, ID pesan, atau isi
+email — ada di repo Android
+`pam-app/docs/evidence/GMAIL_LIVE_IMPORT_2026-11-24.md`.
+
+**Gate G25 (Gmail live) PASS untuk akun pilot owner.** Gate **GCP Rp0 (G29/G37) tetap OPEN**
+karena Billing belum dilepas dan kuota/biaya nyata belum diukur, dan **G36 (SSO Google + tombol
+Run pemilik) tetap NOT RUN**.
+
 ## 4. Bukti yang diminta saat menutup gate
 
 - Project ID dan status Billing (tidak tertaut) — screenshot konsol boleh, tanpa data pribadi.
