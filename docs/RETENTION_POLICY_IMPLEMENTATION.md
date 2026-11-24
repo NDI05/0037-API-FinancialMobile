@@ -37,7 +37,11 @@ fully outside the window or starts in the future:
 - `POST /v1/import-jobs` (job month) and `POST /v1/import-jobs/{id}/batches` (job month and each
   `PARSED` candidate's `eventAt`)
 - `POST /v1/transactions` when `eventAt` is older than the window (import/backfill is bounded)
-- `GET /v1/attachments?transactionId=...` and `POST /v1/attachments` for an expired transaction
+- `GET /v1/attachments?transactionId=...`, `POST /v1/attachments`, and
+  `GET|PATCH|DELETE /v1/attachments/{id}` for metadata tied to an expired transaction
+- `GET /v1/attachments` without a transaction filter clamps expired metadata out of the page
+  (the cursor is preserved so paging still advances)
+- `GET /v1/import-jobs/{id}` when the job's month is outside the window
 
 The error uses the standard envelope with `retryable:false` and an extra `retention` object
 (`windowStart`, `windowEnd`, `startMonthId`, `endMonthId`, `timezone`, `months`). The window is also
@@ -50,8 +54,11 @@ Deliberate exemptions and decisions:
 - Future-dated **manual** entries keep their previous behavior for create/read: the direct
   transaction read path only enforces the **lower** bound (`eventAt < windowStart`), so a future
   event date that already existed keeps working. Period endpoints still reject future months.
-- Direct resource reads (`GET /v1/transactions/{id}`, attachments by id) only enforce the lower
-  bound, because cleanup is what actually removes fully expired rows.
+- Direct transaction reads (`GET /v1/transactions/{id}`) only enforce the lower bound, because
+  cleanup is what actually removes fully expired rows. Attachment metadata resolved by id enforces
+  the same one-year window as its list/create paths; an attachment whose transaction is already
+  gone is treated as expired metadata (`404`). Attachments with no transaction are not period data
+  and stay reachable.
 - Device-side attachment blobs are never deleted server-side; the sweep only removes metadata rows.
 - Any DB failure remains a 5xx; retention checks never mask an infrastructure error as 4xx.
 
@@ -84,8 +91,11 @@ attachment paths. The migration is additive and numbered after the Gmail API mig
 
 ### Dry run vs execution
 
-- **Default is report-only.** `RETENTION_SWEEP_ENABLED=true` only schedules report-only runs; every
-  run writes an audit row and deletes nothing.
+- **Default is report-only.** `RETENTION_SWEEP_ENABLED=true` only schedules report-only runs; a
+  completed run writes an audit row and deletes nothing. An aborted run writes a best-effort
+  `FAILED` audit row (mode/window/timestamps/status and a safe error code, no counts and no PII);
+  the `COMPLETED` row still shares the deletion transaction, so a failure cannot leave partial
+  deletes behind.
 - Deletion requires **all** of: `RETENTION_DELETE_ENABLED=true`, `INTERNAL_SWEEP_TOKEN` configured
   (`config.Load` fails closed otherwise), and for the manual endpoint an explicit
   `?mode=delete&confirm=RETENTION_DELETE`.
@@ -115,7 +125,8 @@ attachment paths. The migration is additive and numbered after the Gmail API mig
   removes only expired rows across all tables and keeps boundary rows, orphan cleanup, owner data stays
   owner-isolated, unknown mode rejected.
 - `internal/httpapi/retention_guard_test.go` — expired/future periods return `400 outside_retention`
-  (not 500) on list/summary/analysis/import/attachment paths; `GET /v1/retention`; internal sweep
+  (not 500) on list/summary/analysis/import/attachment paths; by-id and unfiltered-list attachment
+  guards; expired import-job read; `GET /v1/retention`; internal sweep
   404/401/report-only/delete-gate/confirmation behavior.
 - `internal/config/retention_test.go` — opt-in defaults, interval validation, delete-without-token
   fails closed, delete implies sweep.

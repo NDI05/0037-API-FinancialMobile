@@ -231,7 +231,7 @@ Idempotency-Key: <uuid>
 }
 ```
 Server menurunkan `monthId` dari `eventAt` di Asia/Jakarta, memvalidasi amount/IDR/rentang retensi
-(24 bulan), lalu menyimpan field sensitif (`description`, `merchantLabel`, `note`, `attributes`)
+(12 bulan), lalu menyimpan field sensitif (`description`, `merchantLabel`, `note`, `attributes`)
 sebagai satu JSON AES-GCM. Respons `201`:
 `{ id, revision: 0, monthId, direction, amountMinor, currency, eventAt, categoryId, source,
   createdAt, updatedAt }`.
@@ -581,7 +581,7 @@ Kontrak rinci: [`GMAIL_API_CONTRACT.md`](GMAIL_API_CONTRACT.md); panduan Console
 
 - Opt-in `GMAIL_ENABLED` (default `false`); saat nonaktif `connect/start` → `503 gmail_disabled`,
   callback → `302 pam://gmail/connected?status=error&reason=gmail_disabled`, push → `503`.
-  Status `GET /v1/gmail/status` tetap `200` dengan `connected:false` serta alasan yang aman.
+  Saat nonaktif `GET /v1/gmail/status` juga menjawab `503 gmail_disabled`; Android memetakannya ke state "server belum mengaktifkan tautan Gmail", bukan gangguan jaringan.
 - `POST /v1/gmail/connect/start` memerlukan sesi JWT aktif dan consent Gmail; hasil
   `authorization_url` hanya boleh dibuka owner. `state` acak 256-bit, disimpan sebagai hash,
   sekali pakai, TTL ≤10 menit, terikat owner + PKCE S256.
@@ -609,9 +609,9 @@ Rinci: [`RETENTION_POLICY_IMPLEMENTATION.md`](RETENTION_POLICY_IMPLEMENTATION.md
   Bulan batas parsial dipertahankan barisnya sampai bulan penuh kedaluwarsa. 29 Feb di-clamp ke
   28 Feb. Month ID selalu WIB.
 - Request baca/tulis di luar jendela → `400 outside_retention`, envelope memuat objek `retention`
-  (`start`, `end`, `monthId`) dan `retryable:false`; kesalahan DB tetap `5xx`. Berlaku untuk
-  transaksi list/create, ringkasan GET/PUT, analisis GET/POST, import job/batch, lampiran, dan
-  filter bulan.
+  (`windowStart`, `windowEnd`, `startMonthId`, `endMonthId`, `timezone`, `months`) dan `retryable:false`; kesalahan DB tetap `5xx`. Berlaku untuk
+  transaksi list/create, ringkasan GET/PUT, analisis GET/POST, import job create/batch/read,
+  lampiran create/list/by-id, dan filter bulan.
 - `GET /v1/retention` mengembalikan metadata jendela untuk UI.
 - Sweep: `POST /v1/internal/retention-sweep` dengan `x-internal-token` (`INTERNAL_SWEEP_TOKEN`;
   tanpa token konfigurasi → `404`, salah → `401`). Mode default `report-only` hanya menulis baris

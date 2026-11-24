@@ -71,6 +71,11 @@ func (s *Server) getImportJob(w http.ResponseWriter, r *http.Request) {
 		s.mapWriteError(w, r, err)
 		return
 	}
+	// Job metadata belongs to its month: a job whose period already left the window is not
+	// readable even though its rows may still exist between sweeps.
+	if !s.retainMonth(w, r, job.MonthID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, importJobJSON(job))
 }
 

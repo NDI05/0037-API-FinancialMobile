@@ -48,6 +48,27 @@ func attachmentJSON(attachment store.Attachment) map[string]any {
 	}
 }
 
+// retainAttachment applies the one-year window through the linked transaction. Attachments with no
+// transaction (device-only metadata) carry no period identity and stay reachable; an attachment
+// whose transaction is already gone is treated as expired metadata (404). Direct by-id reads and
+// writes must not bypass the same window the list/create paths enforce.
+func (s *Server) retainAttachment(w http.ResponseWriter, r *http.Request, ownerID string,
+	attachment store.Attachment) bool {
+	if attachment.TransactionID == "" {
+		return true
+	}
+	eventAt, err := s.Store.TransactionEventAt(r.Context(), ownerID, attachment.TransactionID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "Not found", correlationOf(r))
+			return false
+		}
+		s.mapWriteError(w, r, err)
+		return false
+	}
+	return s.retainNotExpired(w, r, eventAt)
+}
+
 func (s *Server) createAttachment(w http.ResponseWriter, r *http.Request) {
 	var body attachmentCreate
 	if !decodeJSON(w, r, &body) {
@@ -105,8 +126,31 @@ func (s *Server) listAttachments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Without an explicit transaction filter the listing can span owners' whole history, so rows
+	// whose transaction is outside the window are clamped out of the page. nextCursor is preserved
+	// even when every row on this page was filtered so the client keeps advancing.
+	expired := map[string]bool{}
 	items := make([]map[string]any, 0, len(page.Items))
 	for _, attachment := range page.Items {
+		if transactionID == "" && attachment.TransactionID != "" {
+			already, seen := expired[attachment.TransactionID]
+			if !seen {
+				eventAt, err := s.Store.TransactionEventAt(r.Context(), info.OwnerID, attachment.TransactionID)
+				switch {
+				case err == nil:
+					already = s.retentionWindow().ValidateNotExpired(eventAt) != nil
+				case errors.Is(err, store.ErrNotFound):
+					already = true
+				default:
+					s.mapWriteError(w, r, err)
+					return
+				}
+				expired[attachment.TransactionID] = already
+			}
+			if already {
+				continue
+			}
+		}
 		items = append(items, attachmentJSON(attachment))
 	}
 	response := map[string]any{"items": items}
@@ -123,6 +167,9 @@ func (s *Server) getAttachment(w http.ResponseWriter, r *http.Request) {
 		s.mapWriteError(w, r, err)
 		return
 	}
+	if !s.retainAttachment(w, r, info.OwnerID, attachment) {
+		return
+	}
 	writeJSON(w, http.StatusOK, attachmentJSON(attachment))
 }
 
@@ -132,6 +179,14 @@ func (s *Server) updateAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info, _ := authFrom(r)
+	current, err := s.Store.GetAttachment(r.Context(), info.OwnerID, r.PathValue("id"))
+	if err != nil {
+		s.mapWriteError(w, r, err)
+		return
+	}
+	if !s.retainAttachment(w, r, info.OwnerID, current) {
+		return
+	}
 	attachment, err := s.Store.UpdateAttachment(r.Context(), info.OwnerID, r.PathValue("id"),
 		store.AttachmentPatch{FileName: body.FileName, StorageRef: body.StorageRef,
 			Attributes: body.Attributes, Revision: body.Revision}, s.Now())
@@ -151,6 +206,14 @@ func (s *Server) deleteAttachment(w http.ResponseWriter, r *http.Request) {
 		expected, _ = strconv.Atoi(raw)
 	}
 	info, _ := authFrom(r)
+	current, err := s.Store.GetAttachment(r.Context(), info.OwnerID, r.PathValue("id"))
+	if err != nil {
+		s.mapWriteError(w, r, err)
+		return
+	}
+	if !s.retainAttachment(w, r, info.OwnerID, current) {
+		return
+	}
 	if err := s.Store.DeleteAttachment(r.Context(), info.OwnerID, r.PathValue("id"),
 		expected, s.Now()); err != nil {
 		s.mapWriteError(w, r, err)

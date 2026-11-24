@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -224,4 +225,33 @@ func deleteExpired(ctx context.Context, tx *sql.Tx, window retention.Window) err
 		}
 	}
 	return nil
+}
+
+// TransactionEventAt returns only the event timestamp of an owner-scoped live row. Retention guard
+// checks must not decrypt sensitive columns, so an expired row whose ciphertext is unreadable still
+// receives a policy decision (400 outside_retention) instead of an internal error.
+func (s *Store) TransactionEventAt(ctx context.Context, ownerID, id string) (time.Time, error) {
+	var ms int64
+	err := s.DB.QueryRowContext(ctx, `SELECT event_at_ms FROM transactions
+		WHERE owner_id = ? AND id = ? AND deleted_at IS NULL`, ownerID, id).Scan(&ms)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, ErrNotFound
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(ms).UTC(), nil
+}
+
+// RecordRetentionSweepFailure writes a FAILED audit row when a sweep aborts before its deletion
+// transaction commits. It runs in its own statement (best effort) so the original error path is
+// unchanged; only mode/window/timestamps/status and a safe error code are stored, never PII.
+func (s *Store) RecordRetentionSweepFailure(ctx context.Context, now time.Time, mode RetentionMode, errorCode string) error {
+	window := retention.NewWindow(now)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO retention_sweeps
+		(id, mode, window_start, window_end, started_at, completed_at, status, counts_json, error_code)
+		VALUES (?, ?, ?, ?, ?, ?, 'FAILED', '{}', ?)`,
+		NewID("rsweep"), string(mode), nowString(window.Start), nowString(window.End),
+		nowString(now), nowString(now), errorCode)
+	return err
 }

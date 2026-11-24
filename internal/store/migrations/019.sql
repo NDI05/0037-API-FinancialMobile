@@ -1,4 +1,6 @@
 -- Migration 019 (018 is reserved by the retention lane). One open DELTA job per owner.
+-- Not purely additive: before the unique index is created, superseded open DELTA jobs are marked
+-- FAILED/superseded so an existing database cannot violate the index. The cleanup is idempotent.
 -- Push bursts and the periodic worker can race between EnsureGmailDeltaJob's SELECT and
 -- INSERT; the partial unique index makes the database the arbiter so two writers never
 -- contend over the same history cursor.

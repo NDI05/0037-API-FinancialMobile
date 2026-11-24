@@ -121,8 +121,12 @@ func (s *Server) internalRetentionSweep(w http.ResponseWriter, r *http.Request) 
 	started := time.Now()
 	result, err := s.Store.SweepRetention(r.Context(), s.Now(), mode)
 	if err != nil {
-		// The audit row is written in the same transaction as the deletes, so a failure leaves no
-		// misleading "completed" evidence and no partial deletion.
+		// The COMPLETED row shares the deletion transaction, so an abort leaves no partial deletion.
+		// A separate FAILED row keeps "every run is auditable" true without pretending the run
+		// finished; failure to write it must not mask the original error.
+		if auditErr := s.Store.RecordRetentionSweepFailure(r.Context(), s.Now(), mode, "sweep_failed"); auditErr != nil {
+			s.Log.Warn("retention_sweep_audit_failed", "code", "audit_write_failed")
+		}
 		s.databaseOrInternal(w, r, err)
 		return
 	}

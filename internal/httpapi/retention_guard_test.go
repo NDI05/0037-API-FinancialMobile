@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/llm"
+	"github.com/pam/recap/backend-go/internal/store"
 )
 
 // retentionTestNow is a fixed wall clock so period boundaries are deterministic in HTTP tests.
@@ -31,6 +32,15 @@ func ownerIDForEmail(t *testing.T, h *harness, email string) string {
 
 // insertExpiredTransaction writes an expired row directly: the public API correctly refuses to
 // create one, so a policy/sweep test needs the pre-existing-row scenario.
+func grantRetentionConsent(t *testing.T, h *harness, token, purpose string) {
+	t.Helper()
+	if status, _ := h.request("POST", "/v1/consents", token, map[string]any{
+		"purpose": purpose, "decision": "GRANTED", "noticeVersion": "v0.4-review",
+	}); status != 201 {
+		t.Fatalf("consent %s status %d", purpose, status)
+	}
+}
+
 func insertExpiredTransaction(t *testing.T, h *harness, ownerID, id string, eventAt time.Time) {
 	t.Helper()
 	sum := sha256.Sum256([]byte(id))
@@ -218,4 +228,105 @@ func retentionRowExists(t *testing.T, h *harness, query string) bool {
 		t.Fatal(err)
 	}
 	return count > 0
+}
+
+// Expired attachment metadata must not stay readable through direct by-id paths, and listings
+// without a transaction filter clamp those rows out while keeping in-window rows visible.
+func TestRetentionGuardsCoverDerivativeAttachmentPaths(t *testing.T) {
+	h := newHarness(t)
+	pinRetentionClock(h)
+	h.register("retention-attachment@example.test")
+	token, _ := h.login("retention-attachment@example.test")
+	grantRetentionConsent(t, h, token, "GMAIL_READ")
+	ownerID := ownerIDForEmail(t, h, "retention-attachment@example.test")
+
+	insertExpiredTransaction(t, h, ownerID, "tx_expired_att", retentionTestNow.AddDate(-1, -2, 0))
+	expiredAttachment, err := h.store.CreateAttachment(context.Background(), ownerID, store.AttachmentInput{
+		TransactionID: "tx_expired_att", FileName: "lama.pdf", Mime: "application/pdf",
+		SizeBytes: 12, Sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		StorageRef: "attachments/2024/01/lama.pdf",
+	}, retentionTestNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// In-window attachment through the public API for the listing contrast.
+	status, body := h.request("POST", "/v1/transactions", token, map[string]any{
+		"direction": "DEBIT", "amountMinor": 1000, "currency": "IDR",
+		"eventAt": "2026-11-18T04:00:00Z",
+	})
+	if status != 201 {
+		t.Fatalf("create transaction = %d %#v", status, body)
+	}
+	status, created := h.request("POST", "/v1/attachments", token, map[string]any{
+		"transactionId": body["id"], "fileName": "baru.pdf", "mimeType": "application/pdf",
+		"sizeBytes": 10, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"storageRef": "attachments/2026/11/baru.pdf",
+	})
+	if status != 201 {
+		t.Fatalf("create attachment = %d %#v", status, created)
+	}
+	knownAttachment := created["id"].(string)
+
+	for _, request := range []struct{ method, path string }{
+		{"GET", "/v1/attachments/" + expiredAttachment.ID},
+		{"PATCH", "/v1/attachments/" + expiredAttachment.ID},
+		{"DELETE", "/v1/attachments/" + expiredAttachment.ID},
+	} {
+		var payload map[string]any
+		if request.method == "PATCH" {
+			payload = map[string]any{"fileName": "x.pdf", "revision": 0}
+		}
+		status, body := h.request(request.method, request.path, token, payload)
+		if status != 400 || body["code"] != "outside_retention" {
+			t.Fatalf("%s %s = %d %#v, want 400 outside_retention", request.method, request.path, status, body)
+		}
+	}
+	if status, body := h.request("GET", "/v1/attachments/"+knownAttachment, token, nil); status != 200 {
+		t.Fatalf("in-window attachment = %d %#v", status, body)
+	}
+
+	status, list := h.request("GET", "/v1/attachments", token, nil)
+	if status != 200 {
+		t.Fatalf("list attachments = %d %#v", status, list)
+	}
+	items, _ := list["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("unfiltered list = %#v, want only the in-window row", list)
+	}
+	if got := items[0].(map[string]any)["id"]; got != knownAttachment {
+		t.Fatalf("unfiltered list kept %v, want %s", got, knownAttachment)
+	}
+}
+
+// Import job metadata is period data: reading a job whose month left the window is a 4xx policy
+// error, not a successful 200 with stale metadata.
+func TestRetentionGuardCoversImportJobRead(t *testing.T) {
+	h := newHarness(t)
+	pinRetentionClock(h)
+	h.register("retention-job@example.test")
+	token, _ := h.login("retention-job@example.test")
+	grantRetentionConsent(t, h, token, "GMAIL_READ")
+	ownerID := ownerIDForEmail(t, h, "retention-job@example.test")
+
+	if _, err := h.store.DB.ExecContext(context.Background(), `INSERT INTO import_jobs
+		(id, owner_id, month_id, state, template_version, started_at)
+		VALUES ('job_expired', ?, '2024-01', 'COMPLETE', 'v1', ?)`,
+		ownerID, retentionTestNow.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	status, body := h.request("GET", "/v1/import-jobs/job_expired", token, nil)
+	if status != 400 || body["code"] != "outside_retention" {
+		t.Fatalf("expired import job read = %d %#v, want 400 outside_retention", status, body)
+	}
+
+	status, created := h.request("POST", "/v1/import-jobs", token, map[string]any{
+		"monthId": "2026-11", "templateVersion": "v1",
+	})
+	if status != 201 {
+		t.Fatalf("in-window import job = %d %#v", status, created)
+	}
+	if status, _ := h.request("GET", "/v1/import-jobs/"+created["id"].(string), token, nil); status != 200 {
+		t.Fatalf("in-window import job read = %d", status)
+	}
 }
