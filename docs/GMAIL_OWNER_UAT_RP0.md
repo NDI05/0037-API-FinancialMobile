@@ -110,12 +110,18 @@ berikutnya, tanpa titik dua) dan tanggal+waktu bertumpuk dengan **nama bulan Ind
 (`12 Okt 2026` + `pkl 09:30:45 WIB`). Perbaikan: commit `5df6be6` (label/waktu stacked) dan
 `c98527b` (bulan Indonesia), diuji dengan regresi `TestParseLivinStacked*` dan
 `TestParseLivinIndonesianMonthAbbreviation`; `go vet/build/test ./... -count=1` + `-race`
-auth/gmail/httpapi/store **PASS**.
+auth/gmail/httpapi/store **PASS**. Audit independen ronde 7 menemukan baris field
+(`Nominal…`/`Tanggal…`/`No. Referensi…`) masih bisa menjadi merchant dan angka bukti belum
+rekonsiliasi; commit `e3b84b4` menambah penjaga field-value, offset WITA/WIT, penggabungan
+tanggal–waktu lintas baris, alias bulan pendek, dan batas panjang label, dengan regresi baru.
 
 Setelah runtime resmi dibangun ulang dari `c98527b` dan dijalankan ulang memakai launcher owner,
 impor live berjalan: ratusan transaksi Livin nyata tersimpan dengan **0 baris duplikat**
-(`source_ref_hash` semua unik): **12/12 bulan backfill COMPLETE dengan 914 transaksi unik**
-(mis. Nov 40/54, Okt 53/86, Sep 0 baru/79 duplikat, Agu 55/124, Apr 97/156, Des 2025 144/170). Rate limit Google ditangani backoff provider (tidak ada
+(`source_ref_hash` semua unik): **12/12 bulan backfill COMPLETE dengan 914 transaksi unik**.
+Run final mengimpor **769** transaksi; **145 baris** (Nov 38, Okt 28, Sep 79) sudah tersimpan dari
+percobaan live pertama sehingga tidak dihitung ulang (79 duplikat Sep = baris Sep yang sama);
+769 + 145 = 914. Contoh lain: Nov 40 baru/54 dipindai, Okt 53/86, Agu 55/124, Apr 97/156,
+Des 2025 144/170. Rate limit Google ditangani backoff provider (tidak ada
 kegagalan permanen). Rincian agregat — tanpa alamat email, nominal, merchant, ID pesan, atau isi
 email — ada di repo Android
 `pam-app/docs/evidence/GMAIL_LIVE_IMPORT_2026-11-24.md`.
