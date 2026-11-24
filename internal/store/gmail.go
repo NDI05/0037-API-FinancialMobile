@@ -165,7 +165,10 @@ func (s *Store) ConsumeGmailOAuthState(ctx context.Context, stateHash string,
 	return ownerID, verifier, redirectURI, nil
 }
 
-// SaveGmailConnection activates (or replaces) the single connection for an owner.
+// SaveGmailConnection activates (or replaces) the single connection for an owner. Replacing a
+// different mailbox resets the sync state in the same transaction: the previous mailbox's backfill
+// progress, delta cursor and pending push events must never be reused, otherwise the new mailbox
+// would skip months it never synced.
 func (s *Store) SaveGmailConnection(ctx context.Context, input GmailConnectionInput) (GmailConnection, error) {
 	emailHash := s.GmailEmailHash(input.AccountEmail)
 	emailSealed, err := s.sealGmailValue(input.OwnerID, gmailPurposeEmail, input.AccountEmail)
@@ -174,6 +177,12 @@ func (s *Store) SaveGmailConnection(ctx context.Context, input GmailConnectionIn
 	}
 	refreshSealed, err := s.sealGmailValue(input.OwnerID, gmailPurposeRefresh, input.RefreshToken)
 	if err != nil {
+		return GmailConnection{}, err
+	}
+	var priorHash string
+	err = s.DB.QueryRowContext(ctx, `SELECT account_email_hash FROM gmail_connections
+		WHERE owner_id = ?`, input.OwnerID).Scan(&priorHash)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return GmailConnection{}, err
 	}
 	var taken int
@@ -185,7 +194,12 @@ func (s *Store) SaveGmailConnection(ctx context.Context, input GmailConnectionIn
 		return GmailConnection{}, ErrGmailMailboxTaken
 	}
 	now := input.Now
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO gmail_connections
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return GmailConnection{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx, `INSERT INTO gmail_connections
 		(id, owner_id, account_email_hash, account_email_ciphertext, account_email_iv,
 		 account_email_tag, account_email_key_version, scope, state, refresh_token_ciphertext,
 		 refresh_token_iv, refresh_token_tag, refresh_token_key_version, watch_expires_at,
@@ -216,6 +230,20 @@ func (s *Store) SaveGmailConnection(ctx context.Context, input GmailConnectionIn
 		nullableTimeString(input.WatchExpiresAt), nullableString(input.HistoryCursor),
 		nowString(now), nowString(now))
 	if err != nil {
+		return GmailConnection{}, err
+	}
+	if priorHash != "" && priorHash != emailHash {
+		// Mailbox switch: jobs and pending events belong to the old mailbox.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM gmail_sync_jobs WHERE owner_id = ?`,
+			input.OwnerID); err != nil {
+			return GmailConnection{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM gmail_push_events
+			WHERE owner_id = ? AND state = 'PENDING'`, input.OwnerID); err != nil {
+			return GmailConnection{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return GmailConnection{}, err
 	}
 	return s.GetGmailConnection(ctx, input.OwnerID)
@@ -435,7 +463,8 @@ func (s *Store) PendingGmailPushEvents(ctx context.Context, ownerID string, limi
 	}
 	rows, err := s.DB.QueryContext(ctx, `SELECT id, owner_id, connection_id, payload_ciphertext,
 		payload_iv, payload_tag, payload_key_version, published_at, state, attempts, last_error_code
-		FROM gmail_push_events WHERE owner_id = ? AND state = 'PENDING'
+		FROM gmail_push_events
+		WHERE owner_id = ? AND (state = 'PENDING' OR (state = 'FAILED' AND attempts < 3))
 		ORDER BY created_at ASC LIMIT ?`, ownerID, limit)
 	if err != nil {
 		return nil, err
@@ -471,7 +500,7 @@ func (s *Store) FinishGmailPushEvent(ctx context.Context, eventID, state, errorC
 	}
 	_, err := s.DB.ExecContext(ctx, `UPDATE gmail_push_events
 		SET state = ?, attempts = attempts + 1, last_error_code = ?, processed_at = ?
-		WHERE id = ? AND state = 'PENDING'`,
+		WHERE id = ? AND state IN ('PENDING', 'FAILED')`,
 		state, nullableString(errorCode), nowString(now), eventID)
 	return err
 }
@@ -561,9 +590,11 @@ func (s *Store) EnsureGmailDeltaJob(ctx context.Context, ownerID string, start, 
 	if !errors.Is(err, sql.ErrNoRows) {
 		return GmailSyncJob{}, err
 	}
+	// ON CONFLICT DO NOTHING plus the partial unique index (migration 018) means a concurrent
+	// writer wins atomically and we simply reuse its job.
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO gmail_sync_jobs
 		(id, owner_id, kind, state, period_start, period_end, created_at, updated_at)
-		VALUES (?, ?, 'DELTA', 'CREATED', ?, ?, ?, ?)`,
+		VALUES (?, ?, 'DELTA', 'CREATED', ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
 		NewID("gsj"), ownerID, nowString(start), nowString(end), nowString(now), nowString(now))
 	if err != nil {
 		return GmailSyncJob{}, err

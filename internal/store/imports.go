@@ -56,6 +56,44 @@ type ImportBatchCounts struct {
 	Unresolved int `json:"unresolved"`
 }
 
+// crossSourceDuplicateTx reports whether a Gmail-API notification is already in the ledger from the
+// legacy IMAP/device path. Each source has its own identity form (device "UIDVALIDITY:UID", server
+// "g:<mailbox>:<message id>"), so the fallback match uses the transaction's natural identity:
+// direction, amount and the exact transaction instant. Rows that are themselves Gmail references
+// are excluded, so two genuinely identical Gmail transactions in the same minute still import as
+// two rows; only the cross-source case is merged.
+func (s *Store) crossSourceDuplicateTx(ctx context.Context, tx *sql.Tx, ownerID string,
+	candidate ImportCandidate) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT source_ref_ciphertext, source_ref_iv,
+		source_ref_tag, source_ref_key_version FROM transactions
+		WHERE owner_id = ? AND direction = ? AND amount_minor = ? AND event_at_ms = ?
+		AND source_ref_hash IS NOT NULL AND deleted_at IS NULL`,
+		ownerID, candidate.Direction, candidate.AmountMinor, candidate.EventAt.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ciphertext, iv, tag []byte
+		var version sql.NullInt64
+		if err := rows.Scan(&ciphertext, &iv, &tag, &version); err != nil {
+			return false, err
+		}
+		if !version.Valid {
+			continue
+		}
+		plain, err := crypto.Open(crypto.Sealed{Ciphertext: ciphertext, IV: iv, Tag: tag,
+			KeyVersion: int(version.Int64)}, s.DataKey, ownerID, "source_ref")
+		if err != nil {
+			continue
+		}
+		if !strings.HasPrefix(string(plain), "g:") {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 func (s *Store) CreateImportJob(ctx context.Context, ownerID, monthID, templateVersion string, now time.Time) (ImportJob, error) {
 	if _, _, err := ParseMonth(monthID); err != nil {
 		return ImportJob{}, err
@@ -183,6 +221,19 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 			}
 			counts.Skipped++
 			continue
+		}
+		if strings.HasPrefix(candidate.SourceRef, "g:") {
+			merged, err := s.crossSourceDuplicateTx(ctx, tx, ownerID, candidate)
+			if err != nil {
+				return ImportBatchCounts{}, nil, false, err
+			}
+			if merged {
+				// The transaction already exists from the legacy IMAP/device path. The Gmail
+				// notification is the same ledger movement, so it becomes a duplicate instead of
+				// a second row; the sealed IMAP identity stays canonical.
+				counts.Duplicates++
+				continue
+			}
 		}
 		sealed, err := crypto.SealJSON(TransactionSensitive{
 			Description: candidate.Description, MerchantLabel: candidate.MerchantLabel,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -125,10 +124,22 @@ func (s *Service) recoverHistory(ctx context.Context, connection store.GmailConn
 	accessToken string, job store.GmailSyncJob, reason string) error {
 	now := s.Now()
 	month := monthOf(now)
-	if _, err := s.importMonthPages(ctx, connection, accessToken, month, "",
-		"recover:"+job.ID, func(page pageProgress) error { return nil }); err != nil {
+	// Resume from the job's checkpoint. Without it a bounded recovery run would restart from page
+	// one forever on a large month, leaving a permanent gap behind the fresh cursor.
+	progress, err := s.importMonthPages(ctx, connection, accessToken, month, job.PageToken,
+		"recover:"+job.ID, func(page pageProgress) error {
+			return s.Store.CheckpointGmailSyncJob(ctx, connection.OwnerID, job.ID, page.NextToken,
+				job.Seen+page.Seen, job.Imported+page.Imported, job.Duplicates+page.Duplicates,
+				job.Skipped+page.Skipped, s.Now())
+		})
+	if err != nil {
 		s.failJob(ctx, connection, job, err)
 		return err
+	}
+	if !progress.Done {
+		// Bounded run: keep the job open so the next tick resumes instead of advancing the cursor
+		// past messages that were never imported.
+		return nil
 	}
 	profile, err := s.Provider.Profile(ctx, accessToken)
 	if err != nil {
@@ -159,8 +170,22 @@ func (s *Service) failJob(ctx context.Context, connection store.GmailConnection,
 	s.recordFailure(ctx, connection, cause)
 }
 
+// candidatePlacement pairs a parsed candidate with the WIB month of its transaction date. The
+// transaction date — never the email's arrival date — decides the accounting month, so an email
+// that arrives after the month boundary still lands in the correct month.
+type candidatePlacement struct {
+	candidate store.ImportCandidate
+	month     string
+}
+
 // importMonthPages lists and imports one WIB month, page by page, checkpointing after each
 // acknowledged page. It is used by the rolling backfill and by the history-recovery scan.
+//
+// Gmail's date search filters by email arrival, which is only approximate: a notification for a
+// transaction on 30 Nov can arrive on 1 Dec. Rows routed to another month inside the retention
+// window are written into that month's own import job (dedupe makes the later canonical scan safe),
+// while rows older than the window are recorded with an explicit outside_retention reason instead
+// of being silently dropped.
 func (s *Service) importMonthPages(ctx context.Context, connection store.GmailConnection,
 	accessToken, month, startToken, prefix string, checkpoint func(pageProgress) error) (pageProgress, error) {
 	now := s.Now()
@@ -168,6 +193,12 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 	if err != nil {
 		return pageProgress{}, err
 	}
+	// A resumed run starts at page ordinal zero with a different page token; folding the token into
+	// the batch key keeps ImportBatch replay detection from comparing two different pages.
+	prefix = prefix + ":" + shortTokenHash(startToken)
+	retention := rollingMonthSet(now, s.Settings.BackfillMonths)
+	extraJobs := map[string]string{}
+	extraSeen := map[string]int{}
 	progress := pageProgress{NextToken: startToken}
 	query := s.monthQuery(month)
 	for pages := 0; pages < s.Settings.MaxPagesPerRun; pages++ {
@@ -177,24 +208,40 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 			s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "PARTIAL", classifyError(err))
 			return pageProgress{}, err
 		}
-		candidates, err := s.buildCandidates(ctx, connection, accessToken, refIDs(list.Messages), month)
+		placements, err := s.buildCandidates(ctx, connection, accessToken, refIDs(list.Messages), month)
 		if err != nil {
 			s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "PARTIAL", classifyError(err))
 			return pageProgress{}, err
 		}
-		if len(candidates) > 0 {
-			counts, importedIDs, _, err := s.Store.ImportBatch(ctx, connection.OwnerID,
-				importJob.ID, fmt.Sprintf("%s:p%d", prefix, pages),
-				candidatesRequestHash(candidates), pages, candidates, now)
-			if err != nil {
-				s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "FAILED", "import_failed")
-				return pageProgress{}, err
+		if len(placements) > 0 {
+			groups, order := routePlacements(placements, month, retention)
+			for _, target := range order {
+				candidates := groups[target]
+				jobID := importJob.ID
+				batchKey := fmt.Sprintf("%s:p%d", prefix, pages)
+				if target != month {
+					jobID, err = s.extraImportJob(ctx, connection.OwnerID, target, extraJobs, now)
+					if err != nil {
+						s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "PARTIAL", "import_failed")
+						return pageProgress{}, err
+					}
+					batchKey = fmt.Sprintf("%s:%s:p%d", prefix, target, pages)
+				}
+				counts, importedIDs, _, err := s.Store.ImportBatch(ctx, connection.OwnerID, jobID,
+					batchKey, candidatesRequestHash(candidates), pages, candidates, now)
+				if err != nil {
+					s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "FAILED", "import_failed")
+					return pageProgress{}, err
+				}
+				progress.Seen += counts.Matched
+				progress.Imported += counts.Imported
+				progress.Duplicates += counts.Duplicates
+				progress.Skipped += counts.Skipped
+				if target != month {
+					extraSeen[target] += counts.Matched
+				}
+				s.autoCategorize(ctx, connection.OwnerID, importedIDs)
 			}
-			progress.Seen += counts.Matched
-			progress.Imported += counts.Imported
-			progress.Duplicates += counts.Duplicates
-			progress.Skipped += counts.Skipped
-			s.autoCategorize(ctx, connection.OwnerID, importedIDs)
 		}
 		progress.NextToken = list.NextPageToken
 		if err := checkpoint(progress); err != nil {
@@ -214,7 +261,80 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 	} else {
 		s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "PARTIAL", "")
 	}
+	for target, jobID := range extraJobs {
+		state := "COMPLETE"
+		if extraSeen[target] == 0 {
+			state = "EMPTY"
+		}
+		s.finalizeMonthJob(ctx, connection.OwnerID, jobID, pageProgress{Seen: extraSeen[target]}, state, "")
+	}
 	return progress, nil
+}
+
+// rollingMonthSet is the retention window used to accept a late notification for an older
+// transaction. Anything outside it gets an explicit rejection instead of a silent drop.
+func rollingMonthSet(now time.Time, months int) map[string]bool {
+	retention := map[string]bool{}
+	for _, month := range rollingMonths(now, months) {
+		retention[month] = true
+	}
+	return retention
+}
+
+// routePlacements groups parsed candidates by their transaction month. The scanning month stays
+// first so the normal path is deterministic; other in-window months are imported into their own
+// job; out-of-window rows stay in the scanning page as UNRESOLVED so the skip is auditable.
+func routePlacements(placements []candidatePlacement, scanningMonth string,
+	retention map[string]bool) (map[string][]store.ImportCandidate, []string) {
+	groups := map[string][]store.ImportCandidate{}
+	order := []string{}
+	for _, placement := range placements {
+		candidate := placement.candidate
+		target := scanningMonth
+		if candidate.Status == "PARSED" && placement.month != "" && placement.month != scanningMonth {
+			if retention[placement.month] {
+				target = placement.month
+			} else {
+				candidate = store.ImportCandidate{
+					Fingerprint:   candidate.Fingerprint,
+					SourceRef:     candidate.SourceRef,
+					Status:        "UNRESOLVED",
+					Reason:        "outside_retention",
+					ParserVersion: TemplateVersion,
+				}
+			}
+		}
+		groups[target] = append(groups[target], candidate)
+	}
+	// Scanning month first, then the routed months in ascending order for a stable provider plan.
+	order = append(order, scanningMonth)
+	sorted := make([]string, 0, len(groups))
+	for target := range groups {
+		if target != scanningMonth {
+			sorted = append(sorted, target)
+		}
+	}
+	sort.Strings(sorted)
+	order = append(order, sorted...)
+	if _, ok := groups[scanningMonth]; !ok {
+		order = order[1:]
+	}
+	return groups, order
+}
+
+// extraImportJob keeps one ad-hoc import job per routed month for the duration of a scan, so the
+// backfill state of the scanning month stays independent from the late-arrival imports.
+func (s *Service) extraImportJob(ctx context.Context, ownerID, month string,
+	cache map[string]string, now time.Time) (string, error) {
+	if id, ok := cache[month]; ok {
+		return id, nil
+	}
+	job, err := s.Store.CreateImportJob(ctx, ownerID, month, TemplateVersion, now)
+	if err != nil {
+		return "", err
+	}
+	cache[month] = job.ID
+	return job.ID, nil
 }
 
 func (s *Service) finalizeMonthJob(ctx context.Context, ownerID, jobID string,
@@ -304,27 +424,22 @@ func (s *Service) importHistoryMessages(ctx context.Context, connection store.Gm
 }
 
 func (s *Service) buildCandidates(ctx context.Context, connection store.GmailConnection,
-	accessToken string, messageIDs []string, month string) ([]store.ImportCandidate, error) {
-	candidates := make([]store.ImportCandidate, 0, len(messageIDs))
+	accessToken string, messageIDs []string, month string) ([]candidatePlacement, error) {
+	placements := make([]candidatePlacement, 0, len(messageIDs))
 	for _, messageID := range messageIDs {
 		candidate, messageMonth, err := s.buildCandidate(ctx, connection, accessToken, messageID)
 		if err != nil {
 			return nil, err
 		}
 		if candidate.Status == "PARSED" && messageMonth != month {
-			// Gmail's after/before filter is approximate; never send an out-of-month row into the
-			// import job, it would reject the whole page.
-			candidate = store.ImportCandidate{
-				Fingerprint:   s.Store.IngestFingerprint(candidate.SourceRef, "", "", 0, time.Unix(0, 0)),
-				SourceRef:     candidate.SourceRef,
-				Status:        "UNRESOLVED",
-				Reason:        "outside_period",
-				ParserVersion: TemplateVersion,
-			}
+			// The Gmail date filter follows email arrival; the parser's transaction date is the
+			// accounting truth. Routing (not dropping) happens in importMonthPages.
+			placements = append(placements, candidatePlacement{candidate: candidate, month: messageMonth})
+			continue
 		}
-		candidates = append(candidates, candidate)
+		placements = append(placements, candidatePlacement{candidate: candidate, month: month})
 	}
-	return candidates, nil
+	return placements, nil
 }
 
 // buildCandidate fetches one raw message (memory only), decodes and parses it, and returns the
@@ -378,6 +493,14 @@ func (s *Service) buildCandidate(ctx context.Context, connection store.GmailConn
 
 // candidatesRequestHash makes the ImportBatch replay detection meaningful: the same page content
 // must produce the same hash, a changed page must conflict instead of silently re-importing.
+func shortTokenHash(token string) string {
+	if token == "" {
+		return "start"
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:4])
+}
+
 func candidatesRequestHash(candidates []store.ImportCandidate) string {
 	hasher := sha256.New()
 	for _, candidate := range candidates {
@@ -399,12 +522,4 @@ func refIDs(refs []MessageRef) []string {
 		}
 	}
 	return ids
-}
-
-func isTransientProviderError(err error) bool {
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.Code == "provider_unavailable"
-	}
-	return false
 }

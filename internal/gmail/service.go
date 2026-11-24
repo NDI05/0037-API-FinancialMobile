@@ -36,7 +36,11 @@ type Settings struct {
 	PageSize         int
 	MaxPagesPerRun   int
 	WatchRenewBefore time.Duration
-	QueryFilter      string
+	// TransientRetryBackoff throttles automatic retries after a provider outage so a broken
+	// upstream is not hammered every worker tick. A needs_reauth connection is never retried
+	// automatically; the user has to reconnect.
+	TransientRetryBackoff time.Duration
+	QueryFilter           string
 }
 
 func (s Settings) withDefaults() Settings {
@@ -64,6 +68,9 @@ func (s Settings) withDefaults() Settings {
 	}
 	if s.AppDeepLink == "" {
 		s.AppDeepLink = "pam://gmail/connected"
+	}
+	if s.TransientRetryBackoff <= 0 || s.TransientRetryBackoff > time.Hour {
+		s.TransientRetryBackoff = 10 * time.Minute
 	}
 	return s
 }
@@ -180,7 +187,7 @@ func (s *Service) Callback(ctx context.Context, code, state string) CallbackResu
 	if exchange.RefreshToken == "" {
 		return CallbackResult{Status: "error", Reason: "refresh_missing"}
 	}
-	if !scopeContains(exchange.Scope, "https://www.googleapis.com/auth/gmail.readonly") {
+	if !scopeContains(exchange.Scope, s.Settings.Scope) {
 		return CallbackResult{Status: "error", Reason: "scope_missing"}
 	}
 	profile, err := s.Provider.Profile(ctx, exchange.AccessToken)
@@ -192,6 +199,24 @@ func (s *Service) Callback(ctx context.Context, code, state string) CallbackResu
 		watch, err = s.Provider.Watch(ctx, exchange.AccessToken, s.Settings.TopicName)
 		if err != nil {
 			return CallbackResult{Status: "error", Reason: "watch_failed"}
+		}
+	}
+	// A reconnect may point the same owner at a different mailbox. Stop and revoke the previous
+	// connection's credential before replacing it, so the old mailbox can no longer deliver push
+	// notifications and the old token is not left valid.
+	if prior, priorErr := s.Store.GetGmailConnection(ctx, ownerID); priorErr == nil &&
+		prior.State == "ACTIVE" && prior.AccountEmailHash != s.Store.GmailEmailHash(profile.EmailAddress) {
+		if token, tokenErr := s.accessToken(ctx, prior); tokenErr == nil {
+			if stopErr := s.Provider.StopWatch(ctx, token); stopErr != nil {
+				s.Log.Warn("gmail_reconnect_stop_watch_failed", "correlationId", "-")
+			}
+		} else {
+			s.Log.Warn("gmail_reconnect_stop_watch_skipped", "correlationId", "-")
+		}
+		if prior.RefreshToken != "" {
+			if revokeErr := s.OAuth.Revoke(ctx, prior.RefreshToken); revokeErr != nil {
+				s.Log.Warn("gmail_reconnect_revoke_failed", "correlationId", "-")
+			}
 		}
 	}
 	connection, err := s.Store.SaveGmailConnection(ctx, store.GmailConnectionInput{
@@ -384,6 +409,11 @@ func (s *Service) RunOnce(ctx context.Context) (SyncReport, error) {
 	}
 	report := SyncReport{Connections: len(connections)}
 	for _, connection := range connections {
+		if skip, reason := s.syncBackoff(connection, now); skip {
+			report.Failures++
+			s.Log.Info("gmail_sync_backoff", "reason", reason)
+			continue
+		}
 		events, err := s.Store.PendingGmailPushEvents(ctx, connection.OwnerID, 20)
 		if err != nil {
 			report.Failures++
@@ -504,14 +534,32 @@ func (s *Service) accessToken(ctx context.Context, connection store.GmailConnect
 
 func (s *Service) recordFailure(ctx context.Context, connection store.GmailConnection, err error) {
 	code := classifyError(err)
+	// Both failure kinds keep the schema's existing sync_state values: needs_reauth is carried in
+	// last_error_code (automatic retries stop until the owner reconnects), while a transient provider
+	// failure is retried after a bounded backoff.
 	syncState := "error"
-	if code == "provider_unavailable" {
-		syncState = "error"
+	lastSyncAt := time.Time{}
+	if code == "provider_unavailable" || code == "provider_error" {
+		lastSyncAt = s.Now()
 	}
 	if updateErr := s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, syncState, "",
-		code, time.Time{}, s.Now()); updateErr != nil {
+		code, lastSyncAt, s.Now()); updateErr != nil {
 		s.Log.Warn("gmail_sync_state_failed")
 	}
+}
+
+// syncBackoff reports whether this connection should be skipped by the current tick. needs_reauth
+// waits for a reconnect; a transient provider failure is retried after a bounded backoff instead of
+// on every tick.
+func (s *Service) syncBackoff(connection store.GmailConnection, now time.Time) (bool, string) {
+	if connection.LastErrorCode == "needs_reauth" {
+		return true, "needs_reauth"
+	}
+	if connection.SyncState == "error" && connection.LastErrorCode == "provider_unavailable" &&
+		!connection.LastSyncAt.IsZero() && now.Sub(connection.LastSyncAt) < s.Settings.TransientRetryBackoff {
+		return true, "provider_unavailable"
+	}
+	return false, ""
 }
 
 func classifyError(err error) string {
