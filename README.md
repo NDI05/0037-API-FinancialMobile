@@ -1,7 +1,8 @@
 # PAM Backend (Go) — 0037 Backend Financial
 
-Backend resmi PAM: REST API, sinkronisasi Gmail (Gmail API + Pub/Sub push), impor riwayat Livin
-setahun, satu job kategorisasi Azure Foundry, retensi setahun, dan dukungan lampiran/analisis.
+Backend resmi PAM: REST API, sinkronisasi Gmail dengan **polling default 15 menit** (push Pub/Sub
+hanya opt-in rollback), impor riwayat Livin setahun, satu job kategorisasi Azure Foundry,
+retensi setahun, dan dukungan lampiran/analisis.
 
 Repositori Android (klien): <https://github.com/NDI05/0037_FinancialMobile>.
 Kontrak API: [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
@@ -53,9 +54,31 @@ Health: `GET /healthz` (liveness) dan `GET /readyz` (database siap).
 
 ## Gmail API
 
-Sinkronisasi Gmail memakai **Gmail API + Pub/Sub push** (bukan IMAP), scope
-`gmail.readonly` saja. Nonaktif secara default; tanpa kredensial Google semua fitur lain tetap
-jalan dan rute Gmail menjawab `503 gmail_disabled`.
+Sinkronisasi Gmail memakai **Gmail API** (bukan IMAP), scope `gmail.readonly` saja.
+
+**Default: mode polling, tanpa Pub/Sub.** Worker di dalam proses API membaca delta
+`history.list` setiap `GMAIL_DELTA_INTERVAL_SECONDS` (default **900 detik / 15 menit**) dan
+menjalankan backfill 12 bulan bergulir WIB secara bertahap. Pada mode ini backend **tidak**
+memasang webhook, **tidak** memanggil `users.watch`/`users.stop`, dan **tidak** memuat verifier
+OIDC; rute `/v1/internal/gmail/push` tidak aktif (404). Delta tetap berjalan **selama proses
+backend hidup**; aplikasi Android boleh tertutup. Target pemakaian pilot adalah **biaya GCP Rp0**
+(tanpa topik/subscription Pub/Sub, tanpa endpoint publik), meski verifikasi tagihan tetap milik
+pemilik.
+
+**Push + `users.watch` + Pub/Sub adalah opt-in rollback**, bukan default: aktif hanya bila
+`GMAIL_MODE=push` dan `GMAIL_PUBSUB_TOPIC`, `GMAIL_PUSH_AUDIENCE`, `GMAIL_PUSH_SERVICE_ACCOUNT`
+diisi. Konfigurasi `push` tanpa topik/audience/service account ditolak saat startup.
+
+Sinkron manual (`POST /v1/gmail/sync`) **tidak pernah** mengimpor secara sinkron; ia menulis
+permintaan ke antrean job durable yang diproses worker:
+
+- `202 {"queued":true,"coalesced":false|true,...}` bila permintaan diterima/digabung;
+- `429 {"code":"sync_cooldown","retryable":true,"retryAfterSeconds":N}` selama cooldown
+  (default 60 detik, `GMAIL_SYNC_COOLDOWN_SECONDS`);
+- `409 gmail_not_connected` / `409 gmail_needs_reauth`, `503 gmail_disabled` bila belum siap.
+
+Permintaan lanjut setelah backend restart dan marker `sync_requested_at` dibersihkan saat job
+drain, sehingga status tidak tertahan "menghubungkan".
 
 Endpoint (kontrak: [`docs/GMAIL_API_CONTRACT.md`](docs/GMAIL_API_CONTRACT.md)):
 
@@ -64,16 +87,21 @@ Endpoint (kontrak: [`docs/GMAIL_API_CONTRACT.md`](docs/GMAIL_API_CONTRACT.md)):
 | `POST` | `/v1/gmail/connect/start` | Bearer PAM |
 | `GET` | `/v1/gmail/connect/callback` | state OAuth (tanpa Bearer) |
 | `GET` | `/v1/gmail/status` | Bearer PAM |
+| `POST` | `/v1/gmail/sync` | Bearer PAM |
 | `POST` | `/v1/gmail/disconnect` | Bearer PAM |
-| `POST` | `/v1/internal/gmail/push` | JWT OIDC Pub/Sub |
+| `POST` | `/v1/internal/gmail/push` | JWT OIDC Pub/Sub — hanya `GMAIL_MODE=push` |
 
-Isi env `GMAIL_*` lalu set `GMAIL_ENABLED=true`; langkah Google Cloud Console, daftar env,
-dan gate yang belum dijalankan ada di [`docs/GMAIL_API_SETUP.md`](docs/GMAIL_API_SETUP.md).
-Refresh token/email/payload push disimpan terenkripsi; raw MIME hanya diproses di memori dan
-PAN/No. Referensi tidak pernah disimpan atau di-log. Worker berjalan di dalam proses API dengan
-tick `GMAIL_WORKER_INTERVAL_SECONDS`. Tidak ada endpoint "sinkronkan sekarang": sinkronisasi
-dipicu oleh push Pub/Sub, tick worker, dan callback koneksi; reconnect di aplikasi cukup memanggil
-`/v1/gmail/connect/start`. Tes memakai provider palsu: `./scripts/go.sh test ./internal/gmail -count=1`.
+Env utama: `GMAIL_ENABLED`, `GMAIL_MODE=polling|push` (default `polling`, `GMAIL_PROVIDER=google|fake`),
+`GMAIL_BACKFILL_MONTHS=12`, `GMAIL_DELTA_INTERVAL_SECONDS=900`,
+`GMAIL_WORKER_INTERVAL_SECONDS`, `GMAIL_SYNC_COOLDOWN_SECONDS=60`, `GMAIL_PAGE_SIZE`,
+`GMAIL_MAX_PAGES_PER_RUN`. Langkah Google Cloud Console, daftar env, dan gate yang belum
+dijalankan ada di [`docs/GMAIL_API_SETUP.md`](docs/GMAIL_API_SETUP.md).
+
+Provider `fake` hanya boleh aktif di `APP_ENV=development` dengan
+`GMAIL_ALLOW_LOOPBACK_REDIRECT=true` dan `GMAIL_DEV_FIXTURE_FILE`; guard menolak kombinasi lain.
+Refresh token/email/payload disimpan terenkripsi; raw MIME hanya diproses di memori dan
+PAN/No. Referensi tidak pernah disimpan atau di-log. Tes memakai provider palsu:
+`./scripts/go.sh test ./internal/gmail -count=1` (termasuk `-race`).
 
 ## Secret dan data
 
@@ -89,7 +117,7 @@ cmd/api, cmd/pam-admin     bootstrap HTTP dan utilitas admin
 internal/config            environment + production secret checks
 internal/crypto            AES-256-GCM (kompatibel format Node)
 internal/auth              scrypt, JWT HS256, refresh token
-internal/store             database/sql libSQL + migrasi 001–017
+internal/store             database/sql libSQL + migrasi 001–020
 internal/finance           kalkulator deterministik BR-01…BR-06
 internal/gmail             OAuth/PKCE, klien Gmail API, parser Livin, worker sinkronisasi
 internal/categoryllm       kategorisasi Azure Foundry + cache/budget
