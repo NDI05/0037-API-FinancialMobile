@@ -426,6 +426,25 @@ func (s *Store) RequeueCategoryJob(ctx context.Context, ownerID, id, leaseToken 
 	return s.GetCategoryJob(ctx, ownerID, id)
 }
 
+// ReleaseCategoryJob returns a claimed job to PENDING without consuming its transient-retry
+// allowance. It is used when a bounded drain window reaches its provider-request cap: the job did
+// not fail, it belongs to a later window, so it must not look like a provider retry to the caller.
+func (s *Store) ReleaseCategoryJob(ctx context.Context, ownerID, id, leaseToken string,
+	now time.Time) (CategoryJob, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE category_jobs SET state='PENDING',lease_token='',
+		lease_until=NULL,lease_until_unix=NULL,updated_at=?
+		WHERE owner_id=? AND id=? AND state='RUNNING' AND lease_token=? AND lease_until_unix > ?`,
+		nowString(now), ownerID, id, leaseToken, now.UnixMilli())
+	if err != nil {
+		return CategoryJob{}, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return CategoryJob{}, s.jobWriteRefusal(ctx, ownerID, id)
+	}
+	return s.GetCategoryJob(ctx, ownerID, id)
+}
+
 // jobWriteRefusal distinguishes "the row is gone / not mine" from "a recovery worker owns it now".
 func (s *Store) jobWriteRefusal(ctx context.Context, ownerID, id string) error {
 	var one int

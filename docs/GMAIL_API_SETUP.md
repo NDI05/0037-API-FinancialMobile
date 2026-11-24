@@ -173,8 +173,10 @@ panggilan (`watchCalls`/`stopCalls` harus 0 di polling), tanpa id/email/token.
 8. **Kategorisasi otomatis ikut jalan**: setelah satu batch impor diakui, worker hanya
    meng-enqueue transaksi yang benar-benar baru (dengan consent `AI_CATEGORIZATION` GRANTED)
    tanpa memanggil provider, lalu menjalankan satu jendela drain server-side yang dibatasi
-   (`CategoryDrainBatch` = 5 merchant/request, `CategoryDrainMaxBatches` = 4 request per jendela
-   2 jam, single-flight per owner). Budget/attempt/token gate tetap berlaku.
+   (`CategoryDrainBatch` = 5 merchant/request, `CategoryDrainMaxProviderCalls` = 4 panggilan
+   provider nyata per jendela 2 jam; `SplitCandidates` dapat memecah batch menjadi beberapa
+   panggilan sehingga batasnya dihitung per request, sisa kandidat ke jendela berikutnya;
+   single-flight per owner). Budget/attempt/token gate tetap berlaku.
 9. **Disconnect** (`POST /v1/gmail/disconnect`): di mode push menghentikan watch; revoke token
    bila mungkin; hapus kredensial tersimpan; tolak pekerjaan baru. Transaksi yang sudah
    dikonfirmasi tidak dihapus.

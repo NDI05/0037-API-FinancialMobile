@@ -21,8 +21,14 @@ const CategoryDrainInterval = 2 * time.Hour
 // attempts, tokens, budget and concurrency allow it.
 const CategoryDrainBatch = 5
 
-// CategoryDrainMaxBatches bounds how many provider requests one window may run, so a large backlog
-// cannot turn into an unbounded burst. Whatever is left is deferred to the next window.
+// CategoryDrainMaxProviderCalls is the hard cap on actual provider requests one 2-hour window may
+// issue. SplitCandidates may split one merchant batch into several provider calls, so counting batch
+// iterations alone would under-count requests; whatever is left stays PENDING for the next window.
+const CategoryDrainMaxProviderCalls = 4
+
+// CategoryDrainMaxBatches bounds how many claim/list iterations one window runs. It is a safety net
+// for the cache-fan-out loop (which issues no provider calls), not the provider-request cap: the
+// latter is CategoryDrainMaxProviderCalls.
 const CategoryDrainMaxBatches = 4
 
 // CategoryCacheFanoutLimit bounds the provider-free pass that applies an already-known merchant
@@ -109,8 +115,9 @@ func (s *Server) enqueueCategoryJobs(w http.ResponseWriter, r *http.Request) {
 
 // drainOwnerQueue is one bounded window of the category queue. It is shared by the HTTP endpoint
 // and the backend scheduler, so an owner whose client never polls still gets drained. Within the
-// window it runs up to CategoryDrainMaxBatches batches of at most CategoryDrainBatch unique
-// merchants, and the remainder is deferred to the next window.
+// window it runs at most CategoryDrainMaxProviderCalls real provider requests (SplitCandidates may
+// split one batch into several calls) and at most CategoryDrainMaxBatches list/claim iterations;
+// the remainder is repaired to PENDING and deferred to the next window.
 func (s *Server) drainOwnerQueue(ctx context.Context, ownerID string, now time.Time, ignoreDue bool) (drainOutcome, error) {
 	unlock, ok := s.acquireOwnerDrain(ownerID)
 	if !ok {
@@ -150,7 +157,8 @@ func (s *Server) drainOwnerQueue(ctx context.Context, ownerID string, now time.T
 	}
 
 	var processed []store.CategoryJob
-	for batch := 0; batch < CategoryDrainMaxBatches; batch++ {
+	providerCalls := 0
+	for batch := 0; batch < CategoryDrainMaxBatches && providerCalls < CategoryDrainMaxProviderCalls; batch++ {
 		jobs, err := s.Store.ListQueuedCategoryJobs(ctx, ownerID, CategoryDrainBatch, now)
 		if err != nil {
 			return out, err
@@ -180,13 +188,19 @@ func (s *Server) drainOwnerQueue(ctx context.Context, ownerID string, now time.T
 			pendingPrepare = append(pendingPrepare, prepared)
 		}
 		if len(pendingPrepare) > 0 {
-			classified, outcome, err := s.classifyGroupWith(ctx, ownerID, pendingPrepare, true)
+			remainingCalls := CategoryDrainMaxProviderCalls - providerCalls
+			classified, outcome, err := s.classifyGroupWith(ctx, ownerID, pendingPrepare, true,
+				remainingCalls)
 			if err != nil {
 				return out, err
 			}
+			providerCalls += outcome.providerCalls
 			processed = append(processed, classified...)
 			if outcome.budgetDenied && !outcome.sawSuccess {
 				out.State = "budget_exhausted"
+				break
+			}
+			if outcome.providerLimited {
 				break
 			}
 		}
@@ -385,9 +399,10 @@ func (s *Server) EnqueueImported(ctx context.Context, ownerID string,
 }
 
 // DrainOwner runs one bounded server-side window after a Gmail import. It reuses the
-// HTTP drain semantics: CategoryDrainBatch merchants per request, CategoryDrainMaxBatches requests,
-// the durable 2-hour window, budget/attempt/token gates and single-flight per owner. An early call
-// does not spend provider budget; the durable CategoryWorker still retries later if it does not fit.
+// HTTP drain semantics: CategoryDrainBatch merchants per request, at most
+// CategoryDrainMaxProviderCalls real provider requests per window, the durable 2-hour window,
+// budget/attempt/token gates and single-flight per owner. An early call does not spend provider
+// budget; the durable CategoryWorker still retries later if it does not fit.
 func (s *Server) DrainOwner(ctx context.Context, ownerID string) error {
 	if !s.autoCategoryEnabled() || !s.autoCategoryConsentGranted(ctx, ownerID) {
 		return nil

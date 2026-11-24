@@ -13,7 +13,8 @@ import (
 //  1. It drains owners whose queue window is open, so an acknowledged backlog is processed without
 //     depending on the Android client polling /drain every two hours. The drain uses the same
 //     bounded window semantics as the HTTP endpoint (at most CategoryDrainBatch unique merchants per
-//     request, at most CategoryDrainMaxBatches requests per window, remainder deferred).
+//     request, at most CategoryDrainMaxProviderCalls real provider requests per window, remainder
+//     deferred).
 //  2. It reclaims RUNNING jobs whose lease expired (the owning request/process died) and runs them
 //     through the same pipeline, applying the bounded transient-retry policy: a job that fails
 //     transiently while its retry_count is 0 is requeued exactly once; a second transient failure

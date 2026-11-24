@@ -813,3 +813,36 @@ func TestLateClassificationResultDiscardedForLifecycleChanges(t *testing.T) {
 		}
 	})
 }
+
+// A window that stops at its provider-request cap must return claimed jobs to PENDING without
+// making them look like provider retries: retry_count stays untouched, the lease is cleared and the
+// next window can claim them again.
+func TestReleaseCategoryJobDoesNotConsumeRetryAllowance(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openCategoryStore(t)
+	owner, txID, _ := regOwnerSetup(t, s, "release-pending@example.test")
+	tx, err := s.GetTransaction(ctx, owner, txID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := claimFence(t, s, owner, txID, tx.Revision)
+	released, err := s.ReleaseCategoryJob(ctx, owner, fence.ID, fence.LeaseToken, regNow)
+	if err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if released.State != "PENDING" || released.LeaseToken != "" {
+		t.Fatalf("released job=%+v", released)
+	}
+	if released.RetryCount != fence.RetryCount {
+		t.Fatalf("release changed retry_count %d -> %d", fence.RetryCount, released.RetryCount)
+	}
+	if _, err := s.ApplyLLMCategory(ctx, owner, txID, tx.Revision, fence.ID, fence.LeaseToken,
+		"", "food", "p", "m", "category-prompt/1", "builtin-categories/1", "r", 0.9,
+		regNow); err != ErrLeaseLost && err == nil {
+		t.Fatalf("stale lease after release: %v", err)
+	}
+	again, claimed, err := s.ClaimCategoryJob(ctx, owner, fence.ID, regNow, time.Hour)
+	if err != nil || !claimed || again == "" {
+		t.Fatalf("re-claim after release: token=%q claimed=%v err=%v", again, claimed, err)
+	}
+}

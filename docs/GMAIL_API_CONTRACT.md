@@ -72,9 +72,12 @@ event durable lalu ACK 2xx. Event ganda/terlambat harus idempoten.
   kategorisasi otomatis **tanpa memanggil provider**. Syarat tetap: consent
   `AI_CATEGORIZATION` `GRANTED`, budget/attempt/token gate durable, dan keputusan kategori
   manual pengguna menang.
-- Server menjalankan jendela drain terbatas: maks. 5 merchant per request provider, maks. 4
-  request per jendela 2 jam, single-flight per owner (tidak ada dua drain paralel). Antrean
-  kosong = nol panggilan provider.
+- Server menjalankan jendela drain terbatas: maks. 5 merchant per request provider dan
+  **maks. 4 panggilan provider nyata per jendela 2 jam** (`CategoryDrainMaxProviderCalls`).
+  `SplitCandidates` dapat memecah satu batch menjadi beberapa panggilan, sehingga batas dihitung
+  per panggilan provider, bukan per batch; sisa kandidat dikembalikan ke antrean PENDING untuk
+  jendela berikutnya (tidak hilang, tidak dihitung sebagai retry provider). Single-flight per
+  owner (tidak ada dua drain paralel). Antrean kosong = nol panggilan provider.
 - Hasil klasifikasi yang terlambat tidak pernah menulis ke owner lain; kegagalan provider tidak
   menghapus transaksi. Status/field API tidak berubah — klien tetap memakai kontrak di atas.
 

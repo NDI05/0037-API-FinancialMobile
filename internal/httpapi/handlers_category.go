@@ -271,6 +271,11 @@ func isReferenceIdentifier(raw string) bool {
 type budgetOutcome struct {
 	budgetDenied bool
 	sawSuccess   bool
+	// providerCalls is the number of real provider requests issued while classifying this group set;
+	// providerLimited reports that a caller-supplied cap stopped the remaining split groups so they
+	// could be left queued for the next window instead of being dropped.
+	providerCalls   int
+	providerLimited bool
 }
 
 // classifyGroup runs the durable pipeline for a set of armed jobs. Providers are coalesced by
@@ -279,13 +284,16 @@ type budgetOutcome struct {
 // applied atomically (consent/deletion/revision guarded) and every job ends terminal
 // (CLASSIFIED/NEEDS_REVIEW/FAILED) or is durably requeued to PENDING for one bounded retry.
 func (s *Server) classifyGroup(ctx context.Context, ownerID string, pending []preparedCategory) ([]store.CategoryJob, budgetOutcome, error) {
-	return s.classifyGroupWith(ctx, ownerID, pending, false)
+	return s.classifyGroupWith(ctx, ownerID, pending, false, 0)
 }
 
 // classifyGroupWith is classifyGroup plus the budget-denial policy. A manual request fails the jobs
 // so the user sees a terminal state and can retry explicitly; the automatic drain requeues them to
 // PENDING instead, because a spent daily budget must delay the backlog, never discard it.
-func (s *Server) classifyGroupWith(ctx context.Context, ownerID string, pending []preparedCategory, requeueOnBudget bool) ([]store.CategoryJob, budgetOutcome, error) {
+// maxProviderCalls > 0 is the drain window's remaining request budget: split groups beyond it are
+// released back to PENDING (without consuming their transient-retry allowance) and reported via
+// outcome.providerLimited. Zero means "no window cap" (manual requests and single-job recovery).
+func (s *Server) classifyGroupWith(ctx context.Context, ownerID string, pending []preparedCategory, requeueOnBudget bool, maxProviderCalls int) ([]store.CategoryJob, budgetOutcome, error) {
 	classifier := s.CategoryClassifier
 	var out []store.CategoryJob
 	var outcome budgetOutcome
@@ -321,7 +329,27 @@ func (s *Server) classifyGroupWith(ctx context.Context, ownerID string, pending 
 		t := byKey[key][0].candidate
 		idxOf[t.Merchant+"\x1f"+t.Direction+"\x1f"+t.Method] = i
 	}
-	for _, group := range classifier.SplitCandidates(unique) {
+	groups := classifier.SplitCandidates(unique)
+	for gi, group := range groups {
+		if maxProviderCalls > 0 && outcome.providerCalls >= maxProviderCalls {
+			outcome.providerLimited = true
+			for _, rest := range groups[gi:] {
+				for _, c := range rest {
+					si, ok := idxOf[c.Merchant+"\x1f"+c.Direction+"\x1f"+c.Method]
+					if !ok {
+						return out, outcome, fmt.Errorf("split group candidate not in batch")
+					}
+					for _, p := range byKey[keyOrder[si]] {
+						rj, err := s.Store.ReleaseCategoryJob(ctx, ownerID, p.job.ID, p.job.LeaseToken, s.Now())
+						if err != nil {
+							return out, outcome, err
+						}
+						out = append(out, rj)
+					}
+				}
+			}
+			break
+		}
 		var shares []int
 		for _, c := range group {
 			shares = append(shares, idxOf[c.Merchant+"\x1f"+c.Direction+"\x1f"+c.Method])
@@ -342,6 +370,9 @@ func (s *Server) classifyGroupWith(ctx context.Context, ownerID string, pending 
 		attempt := s.providerAttempt(ctx, ownerID, group)
 		if attempt.ledgerErr != nil {
 			return out, outcome, attempt.ledgerErr
+		}
+		if attempt.allowed {
+			outcome.providerCalls++
 		}
 		if !attempt.allowed {
 			outcome.budgetDenied = true
