@@ -61,23 +61,65 @@ func (p *GoogleProvider) do(ctx context.Context, method, target, accessToken str
 		return nil, err
 	}
 	if response.StatusCode >= 300 {
-		return nil, providerError(response.StatusCode)
+		return nil, providerError(response.StatusCode, payload)
 	}
 	return payload, nil
 }
 
-// providerError maps HTTP status to a typed, body-free error.
-func providerError(status int) error {
+// googleErrorReasons are the 403 reasons that mean "slow down", not "the grant is gone". A revoked
+// grant answers 401 invalid_grant, which must never be retried automatically.
+var googleErrorReasons = map[string]bool{
+	"rateLimitExceeded":     true,
+	"userRateLimitExceeded": true,
+	"quotaExceeded":         true,
+	"rateLimit":             true,
+	"RESOURCE_EXHAUSTED":    true,
+}
+
+// providerError maps HTTP status (plus the safe reason field, never the body) to a typed error.
+func providerError(status int, body ...[]byte) error {
 	switch status {
-	case http.StatusUnauthorized, http.StatusForbidden:
+	case http.StatusUnauthorized:
+		return ErrUnauthorized
+	case http.StatusForbidden:
+		if len(body) > 0 && googleRateLimitReason(body[0]) {
+			return &APIError{Status: status, Code: "rate_limited"}
+		}
 		return ErrUnauthorized
 	case http.StatusNotFound:
 		return &APIError{Status: status, Code: "not_found", Expired: true}
-	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
-		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusTooManyRequests:
+		return &APIError{Status: status, Code: "rate_limited"}
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
 		return &APIError{Status: status, Code: "provider_unavailable"}
 	}
 	return &APIError{Status: status, Code: "provider_error"}
+}
+
+// googleRateLimitReason extracts only reason/status strings from a Google error envelope; the
+// message body may contain request data and is never read into a log or returned value.
+func googleRateLimitReason(payload []byte) bool {
+	var envelope struct {
+		Error struct {
+			Status string `json:"status"`
+			Errors []struct {
+				Reason string `json:"reason"`
+			} `json:"errors"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return false
+	}
+	if googleErrorReasons[envelope.Error.Status] {
+		return true
+	}
+	for _, item := range envelope.Error.Errors {
+		if googleErrorReasons[item.Reason] {
+			return true
+		}
+	}
+	return false
 }
 
 // IsHistoryExpired reports a 404 from history.list, which means the cursor fell out of Gmail's

@@ -77,18 +77,39 @@ func run() error {
 	// working and the Gmail routes answer 503.
 	var gmailCoordinator *gmail.Coordinator
 	if cfg.Gmail.Enabled {
-		gmailProvider := gmail.NewGoogleProvider(nil)
-		exchanger := gmail.NewOAuth(gmail.OAuthConfig{
-			ClientID:     cfg.Gmail.ClientID,
-			ClientSecret: cfg.Gmail.ClientSecret,
-			RedirectURI:  cfg.Gmail.RedirectURI,
-			AuthURL:      cfg.Gmail.AuthURL,
-			TokenURL:     cfg.Gmail.TokenURL,
-			RevokeURL:    cfg.Gmail.RevokeURL,
-			Scopes:       []string{cfg.Gmail.Scope},
-		})
+		var gmailProvider gmail.Provider
+		var exchanger gmail.TokenExchanger
+		devFake := cfg.Gmail.Provider == "fake"
+		if devFake {
+			// Development/UAT fixture provider: no Google account, no network. The config loader
+			// already refused this combination outside APP_ENV=development.
+			fakeProvider, loadErr := gmail.LoadDevFixture(cfg.Gmail.DevFixtureFile,
+				cfg.Gmail.DevScenario)
+			if loadErr != nil {
+				logger.Error("gmail_dev_fixture_invalid", "error", "fixture_load_failed")
+				os.Exit(1)
+			}
+			gmailProvider = fakeProvider
+			tokens := gmail.TokenSet{AccessToken: "dev-access-token",
+				RefreshToken: "dev-refresh-token", Expiry: time.Now().Add(time.Hour),
+				Scope: cfg.Gmail.Scope}
+			exchanger = &gmail.FakeExchanger{AcceptAnyCode: true, DefaultTokens: tokens,
+				ByRefresh: map[string]gmail.TokenSet{"dev-refresh-token": tokens}}
+		} else {
+			gmailProvider = gmail.NewGoogleProvider(nil)
+			exchanger = gmail.NewOAuth(gmail.OAuthConfig{
+				ClientID:     cfg.Gmail.ClientID,
+				ClientSecret: cfg.Gmail.ClientSecret,
+				RedirectURI:  cfg.Gmail.RedirectURI,
+				AuthURL:      cfg.Gmail.AuthURL,
+				TokenURL:     cfg.Gmail.TokenURL,
+				RevokeURL:    cfg.Gmail.RevokeURL,
+				Scopes:       []string{cfg.Gmail.Scope},
+			})
+		}
 		gmailService := gmail.NewService(storeLayer, gmailProvider, exchanger, gmail.Settings{
 			RedirectURI:      cfg.Gmail.RedirectURI,
+			Mode:             cfg.Gmail.Mode,
 			AppDeepLink:      cfg.Gmail.AppDeepLink,
 			TopicName:        cfg.Gmail.TopicName,
 			Scope:            cfg.Gmail.Scope,
@@ -97,12 +118,20 @@ func run() error {
 			PageSize:         cfg.Gmail.PageSize,
 			MaxPagesPerRun:   cfg.Gmail.MaxPagesPerRun,
 			WatchRenewBefore: cfg.Gmail.WatchRenewBefore,
+			DeltaInterval:    cfg.Gmail.DeltaInterval,
+			SyncCooldown:     cfg.Gmail.SyncCooldown,
+			DevFake:          devFake,
+			DevScenario:      cfg.Gmail.DevScenario,
 		}, logger)
-		verifier := gmail.NewOIDCVerifier(gmail.OIDCConfig{
-			Audience:       cfg.Gmail.PushAudience,
-			ServiceAccount: cfg.Gmail.PushServiceAccount,
-			JWKSURL:        cfg.Gmail.JWKSURL,
-		})
+		// Push is opt-in: only push mode builds the OIDC verifier and registers the Pub/Sub route.
+		var verifier gmail.PushVerifier
+		if cfg.Gmail.Mode == "push" {
+			verifier = gmail.NewOIDCVerifier(gmail.OIDCConfig{
+				Audience:       cfg.Gmail.PushAudience,
+				ServiceAccount: cfg.Gmail.PushServiceAccount,
+				JWKSURL:        cfg.Gmail.JWKSURL,
+			})
+		}
 		// The Gmail worker imports server-side, so it must be the one that starts the automatic
 		// categorization window: the Android client cannot know about backfilled rows.
 		gmailService.Categories = api

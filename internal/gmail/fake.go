@@ -30,6 +30,7 @@ type FakeProvider struct {
 	StopErr    error
 
 	OnList    func(ctx context.Context, query, pageToken string) (MessageList, error)
+	OnProfile func(ctx context.Context) (Profile, error)
 	OnGet     func(ctx context.Context, id string) (RawMessage, error)
 	OnHistory func(ctx context.Context, start, pageToken string) (HistoryPage, error)
 }
@@ -93,6 +94,9 @@ func (f *FakeProvider) StopWatch(ctx context.Context, accessToken string) error 
 func (f *FakeProvider) Profile(ctx context.Context, accessToken string) (Profile, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.OnProfile != nil {
+		return f.OnProfile(ctx)
+	}
 	if f.ProfileErr != nil {
 		return Profile{}, f.ProfileErr
 	}
@@ -128,6 +132,12 @@ type FakeExchanger struct {
 	Revokes   int
 	Revoked   []string
 
+	// AcceptAnyCode is the development fixture flow: the backend-served consent page returns a
+	// one-time code it generated itself, so no Google code map is needed. It never applies to the
+	// real OAuth exchanger.
+	AcceptAnyCode bool
+	DefaultTokens TokenSet
+
 	ExchangeErr error
 	RefreshErr  error
 	RevokeErr   error
@@ -139,6 +149,22 @@ func (f *FakeExchanger) Exchange(ctx context.Context, code, verifier, redirectUR
 	f.Exchanges++
 	if f.ExchangeErr != nil {
 		return TokenSet{}, f.ExchangeErr
+	}
+	if f.AcceptAnyCode && code != "" {
+		tokens := f.DefaultTokens
+		if tokens.AccessToken == "" {
+			tokens.AccessToken = "dev-access-token"
+		}
+		if tokens.RefreshToken == "" {
+			tokens.RefreshToken = "dev-refresh-token"
+		}
+		if tokens.Expiry.IsZero() {
+			tokens.Expiry = time.Now().Add(time.Hour)
+		}
+		if tokens.Scope == "" {
+			tokens.Scope = "https://www.googleapis.com/auth/gmail.readonly"
+		}
+		return tokens, nil
 	}
 	token, ok := f.ByCode[code]
 	if !ok {
@@ -167,6 +193,13 @@ func (f *FakeExchanger) Revoke(ctx context.Context, token string) error {
 	f.Revokes++
 	f.Revoked = append(f.Revoked, token)
 	return f.RevokeErr
+}
+
+// Counters returns the exchange/refresh/revoke counts for the dev stats endpoint.
+func (f *FakeExchanger) Counters() (exchanges, refreshes, revokes int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Exchanges, f.Refreshes, f.Revokes
 }
 
 // FakePushVerifier accepts exactly the configured token.

@@ -124,8 +124,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/deletion-receipts/{token}", s.getDeletionReceipt)
 	mux.Handle("POST /v1/gmail/connect/start", s.authed(s.gmailConnectStart))
 	mux.HandleFunc("GET /v1/gmail/connect/callback", s.gmailConnectCallback)
+	// Development fixture consent pages are always registered but answer 404 unless the fake
+	// provider is active, so production cannot reach them.
+	mux.HandleFunc("GET /v1/gmail/connect/dev/authorize", s.gmailDevAuthorize)
+	mux.HandleFunc("GET /v1/gmail/connect/dev/approve", s.gmailDevApprove)
+	mux.Handle("GET /v1/gmail/dev/stats", s.authed(s.gmailDevStats))
 	mux.Handle("GET /v1/gmail/status", s.authed(s.gmailStatus))
+	mux.Handle("POST /v1/gmail/sync", s.authed(s.gmailSync))
 	mux.Handle("POST /v1/gmail/disconnect", s.authed(s.gmailDisconnect))
+	// The push route exists in the table but answers 404 when no verifier is configured (polling
+	// mode or disabled Gmail), so the contract's "route absent" assertion holds without depending
+	// on startup ordering.
 	mux.HandleFunc("POST /v1/internal/gmail/push", s.gmailPush)
 	mux.HandleFunc("POST /v1/internal/sweep", s.internalSweep)
 	// Retention surface (CR-005): the public GET lets clients clamp their period picker; the
@@ -171,7 +180,9 @@ func sanitizedRoute(path string) string {
 	case path == "/v1/internal/sweep" || path == "/v1/internal/gmail/push":
 		return path
 	case path == "/v1/gmail/connect/start" || path == "/v1/gmail/connect/callback" ||
-		path == "/v1/gmail/status" || path == "/v1/gmail/disconnect":
+		path == "/v1/gmail/connect/dev/authorize" || path == "/v1/gmail/connect/dev/approve" ||
+		path == "/v1/gmail/status" || path == "/v1/gmail/sync" ||
+		path == "/v1/gmail/dev/stats" || path == "/v1/gmail/disconnect":
 		return path
 	case path == "/v1/internal/retention-sweep":
 		return path

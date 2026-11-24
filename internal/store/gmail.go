@@ -128,6 +128,31 @@ func (s *Store) CreateGmailOAuthState(ctx context.Context, ownerID, stateHash, c
 	return err
 }
 
+// PeekGmailOAuthState validates a pending state without consuming it. The development fixture
+// consent page needs this to render/approve the flow while the real callback stays the only place
+// that consumes the single-use state.
+func (s *Store) PeekGmailOAuthState(ctx context.Context, stateHash string,
+	now time.Time) (ownerID, redirectURI string, err error) {
+	var expiresAt string
+	var consumedAt sql.NullString
+	err = s.DB.QueryRowContext(ctx, `SELECT owner_id, redirect_uri, expires_at, consumed_at
+		FROM gmail_oauth_states WHERE state_hash = ?`, stateHash).Scan(&ownerID, &redirectURI,
+		&expiresAt, &consumedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", ErrGmailStateInvalid
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if consumedAt.Valid {
+		return "", "", ErrGmailStateInvalid
+	}
+	if !parseTime(expiresAt).After(now) {
+		return "", "", ErrGmailStateExpired
+	}
+	return ownerID, redirectURI, nil
+}
+
 // ConsumeGmailOAuthState atomically marks the state used and returns the owner and PKCE
 // verifier. Replays and expired states fail closed.
 func (s *Store) ConsumeGmailOAuthState(ctx context.Context, stateHash string,
@@ -648,8 +673,23 @@ func (s *Store) EnsureGmailBackfillJob(ctx context.Context, ownerID, monthID str
 
 // OpenGmailDeltaJob returns the in-flight delta job, if any.
 func (s *Store) OpenGmailDeltaJob(ctx context.Context, ownerID string) (GmailSyncJob, bool, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
+	row := s.DB.QueryRowContext(ctx, `SELECT `+gmailSyncJobColumns+` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = 'DELTA' AND state IN ('CREATED', 'RUNNING')
+		ORDER BY created_at DESC LIMIT 1`, ownerID)
+	job, err := s.scanGmailSyncJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GmailSyncJob{}, false, nil
+	}
+	if err != nil {
+		return GmailSyncJob{}, false, err
+	}
+	return job, true, nil
+}
+
+// OpenGmailBackfillJob returns the in-flight staged backfill month, if any.
+func (s *Store) OpenGmailBackfillJob(ctx context.Context, ownerID string) (GmailSyncJob, bool, error) {
+	row := s.DB.QueryRowContext(ctx, `SELECT `+gmailSyncJobColumns+` FROM gmail_sync_jobs
+		WHERE owner_id = ? AND kind = 'BACKFILL' AND state IN ('CREATED', 'RUNNING')
 		ORDER BY created_at DESC LIMIT 1`, ownerID)
 	job, err := s.scanGmailSyncJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -664,7 +704,7 @@ func (s *Store) OpenGmailDeltaJob(ctx context.Context, ownerID string) (GmailSyn
 // EnsureGmailDeltaJob reuses one open delta job per owner, or creates one starting at cursor.
 func (s *Store) EnsureGmailDeltaJob(ctx context.Context, ownerID string, start, end time.Time,
 	now time.Time) (GmailSyncJob, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
+	row := s.DB.QueryRowContext(ctx, `SELECT `+gmailSyncJobColumns+` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = 'DELTA' AND state IN ('CREATED', 'RUNNING')
 		ORDER BY created_at DESC LIMIT 1`, ownerID)
 	job, err := s.scanGmailSyncJob(row)
@@ -683,14 +723,14 @@ func (s *Store) EnsureGmailDeltaJob(ctx context.Context, ownerID string, start, 
 	if err != nil {
 		return GmailSyncJob{}, err
 	}
-	row = s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
+	row = s.DB.QueryRowContext(ctx, `SELECT `+gmailSyncJobColumns+` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = 'DELTA' AND state IN ('CREATED', 'RUNNING')
 		ORDER BY created_at DESC LIMIT 1`, ownerID)
 	return s.scanGmailSyncJob(row)
 }
 
 func (s *Store) gmailSyncJob(ctx context.Context, ownerID, kind, monthID string) (GmailSyncJob, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs
+	row := s.DB.QueryRowContext(ctx, `SELECT `+gmailSyncJobColumns+` FROM gmail_sync_jobs
 		WHERE owner_id = ? AND kind = ? AND COALESCE(month_id, '') = ?`,
 		ownerID, kind, monthID)
 	return s.scanGmailSyncJob(row)
@@ -734,7 +774,7 @@ func (s *Store) StartGmailSyncJob(ctx context.Context, ownerID, jobID string, no
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		return GmailSyncJob{}, ErrGmailJobNotOpen
 	}
-	row := s.DB.QueryRowContext(ctx, `SELECT ` + gmailSyncJobColumns + ` FROM gmail_sync_jobs WHERE owner_id = ? AND id = ?`,
+	row := s.DB.QueryRowContext(ctx, `SELECT `+gmailSyncJobColumns+` FROM gmail_sync_jobs WHERE owner_id = ? AND id = ?`,
 		ownerID, jobID)
 	return s.scanGmailSyncJob(row)
 }

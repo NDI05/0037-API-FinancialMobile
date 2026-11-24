@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/store"
@@ -20,6 +21,7 @@ type pageProgress struct {
 	Imported   int
 	Duplicates int
 	Skipped    int
+	PagesDone  int
 }
 
 // runBackfill advances the rolling one-year window by one month (current month first).
@@ -43,9 +45,10 @@ func (s *Service) runBackfill(ctx context.Context, connection store.GmailConnect
 		return err
 	}
 	progress, err := s.importMonthPages(ctx, connection, accessToken, month, job.PageToken,
-		"backfill:"+job.ID, func(page pageProgress) error {
+		"backfill:"+job.ID, "", func(page pageProgress) error {
 			return s.Store.CheckpointGmailSyncJob(ctx, connection.OwnerID, job.ID, page.NextToken,
-				page.Seen, page.Imported, page.Duplicates, page.Skipped, s.Now())
+				page.Seen, page.Imported, page.Duplicates, page.Skipped,
+				job.PagesDone+page.PagesDone, s.Now())
 		})
 	if err != nil {
 		s.failJob(ctx, connection, job, err)
@@ -77,6 +80,11 @@ func (s *Service) runDelta(ctx context.Context, connection store.GmailConnection
 	if err := s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "delta", "", "", time.Time{}, now); err != nil {
 		return err
 	}
+	// A recovery run encodes its month/baseline/checkpoint in the sealed page token. Resume there
+	// before touching history.list, otherwise a bounded recovery would restart from page one.
+	if _, _, _, resuming := decodeRecoveryState(job.PageToken); resuming {
+		return s.recoverHistory(ctx, connection, accessToken, job, "history_expired")
+	}
 	cursor := connection.HistoryCursor
 	if cursor == "" {
 		return s.recoverHistory(ctx, connection, accessToken, job, "cursor_missing")
@@ -102,7 +110,8 @@ func (s *Service) runDelta(ctx context.Context, connection store.GmailConnection
 			latest = page.LatestHistoryID
 		}
 		if err := s.Store.CheckpointGmailSyncJob(ctx, connection.OwnerID, job.ID, pageToken,
-			job.Seen, job.Imported, job.Duplicates, job.Skipped, s.Now()); err != nil {
+			job.Seen, job.Imported, job.Duplicates, job.Skipped,
+			job.PagesDone+pages+1, s.Now()); err != nil {
 			return err
 		}
 		if pageToken == "" {
@@ -118,54 +127,228 @@ func (s *Service) runDelta(ctx context.Context, connection store.GmailConnection
 	return s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "idle", latest, "", s.Now(), s.Now())
 }
 
-// recoverHistory is the documented recovery path for an expired/missing cursor: re-scan the
-// current month (dedupe makes it safe), take a fresh cursor from profile and close the delta job.
+// recoveryTokenPrefix marks a delta job that is executing the cross-month recovery scan. The
+// sealed page token carries the current month, the pre-scan baseline historyId and the page token,
+// so a restart resumes exactly where the last acknowledged page ended.
+const recoveryTokenPrefix = "recover:v1:"
+
+func encodeRecoveryState(month, baseline, pageToken string) string {
+	return recoveryTokenPrefix + month + ":" + baseline + ":" + pageToken
+}
+
+func decodeRecoveryState(raw string) (month, baseline, pageToken string, ok bool) {
+	if !strings.HasPrefix(raw, recoveryTokenPrefix) {
+		return "", "", "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(raw, recoveryTokenPrefix), ":", 3)
+	if len(parts) != 3 || parts[0] == "" {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], true
+}
+
+// recoverHistory is the documented recovery path for an expired/missing history cursor. It:
+//  1. captures the baseline profile historyId BEFORE scanning (never the post-scan id, which could
+//     skip messages that arrived during the scan),
+//  2. re-scans every WIB month from the last known success up to now, clamped to the 12-month
+//     retention window, using after:<unix> + before:<unix> per month,
+//  3. checkpoints after every acknowledged ImportBatch page (month + token + baseline),
+//  4. sets the cursor back to the baseline and replays the delta from it.
+//
+// The scan is bounded by MaxPagesPerRun per tick, so a large downtime is resumed by the next tick
+// from the sealed checkpoint instead of restarting.
 func (s *Service) recoverHistory(ctx context.Context, connection store.GmailConnection,
 	accessToken string, job store.GmailSyncJob, reason string) error {
 	now := s.Now()
-	month := monthOf(now)
-	// Resume from the job's checkpoint. Without it a bounded recovery run would restart from page
-	// one forever on a large month, leaving a permanent gap behind the fresh cursor.
-	progress, err := s.importMonthPages(ctx, connection, accessToken, month, job.PageToken,
-		"recover:"+job.ID, func(page pageProgress) error {
-			return s.Store.CheckpointGmailSyncJob(ctx, connection.OwnerID, job.ID, page.NextToken,
-				job.Seen+page.Seen, job.Imported+page.Imported, job.Duplicates+page.Duplicates,
-				job.Skipped+page.Skipped, s.Now())
-		})
-	if err != nil {
-		s.failJob(ctx, connection, job, err)
-		return err
+	baseline, resumeMonth, resumeToken := "", "", ""
+	resuming := false
+	if month, base, token, ok := decodeRecoveryState(job.PageToken); ok {
+		baseline, resumeMonth, resumeToken, resuming = base, month, token, true
 	}
-	if !progress.Done {
-		// Bounded run: keep the job open so the next tick resumes instead of advancing the cursor
-		// past messages that were never imported.
+	if !resuming {
+		// Capture the baseline BEFORE the scan: messages that arrive while the scan runs must replay
+		// through the delta, not disappear behind a newer cursor.
+		profile, err := s.Provider.Profile(withOwner(ctx, connection.OwnerID), accessToken)
+		if err != nil {
+			s.failJob(ctx, connection, job, err)
+			return err
+		}
+		baseline = profile.HistoryID
+	}
+	months := rollingMonths(now, s.Settings.BackfillMonths)
+	if len(months) == 0 {
 		return nil
 	}
-	profile, err := s.Provider.Profile(ctx, accessToken)
-	if err != nil {
-		s.failJob(ctx, connection, job, err)
-		return err
+	retentionStart, _ := monthWindow(months[len(months)-1])
+	rangeStart := connection.LastSuccessAt
+	if rangeStart.IsZero() {
+		rangeStart = connection.LastAttemptAt
+	}
+	if rangeStart.IsZero() || rangeStart.Before(retentionStart) {
+		rangeStart = retentionStart
+	}
+	if rangeStart.After(now) {
+		rangeStart = now
+	}
+	scanMonths := monthsBetween(rangeStart, now)
+	startIndex := 0
+	if resuming {
+		for index, month := range scanMonths {
+			if month == resumeMonth {
+				startIndex = index
+				break
+			}
+		}
+	}
+	seen, imported, duplicates, skipped := job.Seen, job.Imported, job.Duplicates, job.Skipped
+	pagesDone := job.PagesDone
+	for _, month := range scanMonths[startIndex:] {
+		monthStart, monthEnd := monthWindow(month)
+		from := monthStart
+		if rangeStart.After(from) {
+			from = rangeStart
+		}
+		to := monthEnd
+		if now.Before(to) {
+			to = now
+		}
+		startToken := ""
+		if resuming && month == resumeMonth {
+			startToken = resumeToken
+		}
+		query := recoveryQuery(s.Settings.QueryFilter, from, to)
+		progress, err := s.importMonthPages(ctx, connection, accessToken, month, startToken,
+			"recover:"+job.ID, query, func(page pageProgress) error {
+				nextToken := page.NextToken
+				if !page.Done {
+					nextToken = encodeRecoveryState(month, baseline, page.NextToken)
+				}
+				return s.Store.CheckpointGmailSyncJob(ctx, connection.OwnerID, job.ID, nextToken,
+					seen+page.Seen, imported+page.Imported, duplicates+page.Duplicates,
+					skipped+page.Skipped, pagesDone+page.PagesDone, s.Now())
+			})
+		if err != nil {
+			s.failJob(ctx, connection, job, err)
+			return err
+		}
+		seen += progress.Seen
+		imported += progress.Imported
+		duplicates += progress.Duplicates
+		skipped += progress.Skipped
+		pagesDone += progress.PagesDone
+		if !progress.Done {
+			// Bounded run: the checkpoint holds this month and page; the next tick resumes it.
+			return nil
+		}
+		resuming = false
 	}
 	if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, "COMPLETE", reason,
 		now); err != nil {
 		return err
 	}
-	return s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "idle", profile.HistoryID, "",
-		now, now)
+	if err := s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "idle", baseline, "", now,
+		now); err != nil {
+		return err
+	}
+	// Replay from the baseline so notifications that arrived during the recovery scan are not lost.
+	connection.HistoryCursor = baseline
+	return s.replayDeltaAfterRecovery(ctx, connection, accessToken)
 }
 
-// failJob records a typed failure and marks the connection as errored. The next tick retries the
-// same month; a retried backfill page is safe because the page token was not advanced.
+// recoveryQuery filters one recovery month by absolute unix bounds. after:/before: are inclusive of
+// the email timestamp, and the local parser still re-checks the transaction month afterwards.
+func recoveryQuery(base string, from, to time.Time) string {
+	return fmt.Sprintf("%s after:%d before:%d", base, from.Unix(), to.Unix())
+}
+
+// monthsBetween returns the WIB months from start to end inclusive, ascending.
+func monthsBetween(start, end time.Time) []string {
+	first, last := monthOf(start), monthOf(end)
+	months := []string{}
+	for month := first; month != "" && month <= last; month = shiftMonth(month, 1) {
+		months = append(months, month)
+	}
+	return months
+}
+
+// replayDeltaAfterRecovery runs one bounded history replay from the recovered baseline. A second
+// expiry is not recovered recursively: the job is closed and the normal 15-minute delta cadence
+// retries later, while the month scans above keep every retained notification importable.
+func (s *Service) replayDeltaAfterRecovery(ctx context.Context, connection store.GmailConnection,
+	accessToken string) error {
+	now := s.Now()
+	if connection.HistoryCursor == "" {
+		return nil
+	}
+	job, err := s.Store.EnsureGmailDeltaJob(ctx, connection.OwnerID, now.Add(-48*time.Hour), now, now)
+	if err != nil {
+		return err
+	}
+	job, err = s.Store.StartGmailSyncJob(ctx, connection.OwnerID, job.ID, now)
+	if err != nil {
+		return err
+	}
+	latest := connection.HistoryCursor
+	pageToken := job.PageToken
+	for pages := 0; pages < s.Settings.MaxPagesPerRun; pages++ {
+		page, listErr := s.Provider.History(withOwner(ctx, connection.OwnerID), accessToken,
+			connection.HistoryCursor, pageToken, s.Settings.PageSize)
+		if listErr != nil {
+			if IsHistoryExpired(listErr) {
+				// The provider still refuses the cursor; close the replay and let the next scheduled
+				// recovery rescan the retained months (idempotent) instead of looping now.
+				if finishErr := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID,
+					"COMPLETE", "history_expired", now); finishErr != nil {
+					return finishErr
+				}
+				return nil
+			}
+			s.failJob(ctx, connection, job, listErr)
+			return listErr
+		}
+		if err := s.importHistoryMessages(ctx, connection, accessToken, page.MessageIDs); err != nil {
+			s.failJob(ctx, connection, job, err)
+			return err
+		}
+		pageToken = page.NextPageToken
+		if page.LatestHistoryID != "" {
+			latest = page.LatestHistoryID
+		}
+		if err := s.Store.CheckpointGmailSyncJob(ctx, connection.OwnerID, job.ID, pageToken,
+			job.Seen, job.Imported, job.Duplicates, job.Skipped,
+			job.PagesDone+pages+1, s.Now()); err != nil {
+			return err
+		}
+		if pageToken == "" {
+			break
+		}
+	}
+	if pageToken != "" {
+		return nil
+	}
+	if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, "COMPLETE", "", s.Now()); err != nil {
+		return err
+	}
+	return s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "idle", latest, "", s.Now(), s.Now())
+}
+
+// failJob records a typed failure. A revoked grant becomes NEEDS_REAUTH (terminal until the owner
+// reconnects); a retryable provider failure (rate limit, 5xx) keeps the same job open at its last
+// acknowledged checkpoint so the next tick resumes instead of losing the batch.
 func (s *Service) failJob(ctx context.Context, connection store.GmailConnection,
 	job store.GmailSyncJob, cause error) {
 	now := s.Now()
-	state := "FAILED"
 	code := classifyError(cause)
 	if code == "needs_reauth" {
-		state = "NEEDS_REAUTH"
+		if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, "NEEDS_REAUTH", code,
+			now); err != nil {
+			s.Log.Warn("gmail_sync_finish_failed")
+		}
+		s.recordFailure(ctx, connection, cause)
+		return
 	}
-	if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, state, code, now); err != nil {
-		s.Log.Warn("gmail_sync_finish_failed")
+	if err := s.Store.RequeueGmailSyncJob(ctx, connection.OwnerID, job.ID, code, now); err != nil {
+		s.Log.Warn("gmail_sync_requeue_failed")
 	}
 	s.recordFailure(ctx, connection, cause)
 }
@@ -187,7 +370,8 @@ type candidatePlacement struct {
 // while rows older than the window are recorded with an explicit outside_retention reason instead
 // of being silently dropped.
 func (s *Service) importMonthPages(ctx context.Context, connection store.GmailConnection,
-	accessToken, month, startToken, prefix string, checkpoint func(pageProgress) error) (pageProgress, error) {
+	accessToken, month, startToken, prefix, queryOverride string,
+	checkpoint func(pageProgress) error) (pageProgress, error) {
 	now := s.Now()
 	importJob, err := s.Store.CreateImportJob(ctx, connection.OwnerID, month, TemplateVersion, now)
 	if err != nil {
@@ -200,7 +384,10 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 	extraJobs := map[string]string{}
 	extraSeen := map[string]int{}
 	progress := pageProgress{NextToken: startToken}
-	query := s.monthQuery(month)
+	query := queryOverride
+	if query == "" {
+		query = s.monthQuery(month)
+	}
 	for pages := 0; pages < s.Settings.MaxPagesPerRun; pages++ {
 		list, err := s.Provider.ListMessages(ctx, accessToken, query, progress.NextToken,
 			s.Settings.PageSize)
@@ -244,6 +431,7 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 			}
 		}
 		progress.NextToken = list.NextPageToken
+		progress.PagesDone++
 		if err := checkpoint(progress); err != nil {
 			return pageProgress{}, err
 		}
