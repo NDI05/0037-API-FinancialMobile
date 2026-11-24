@@ -137,6 +137,15 @@ func (s *Store) FindAccountByEmail(ctx context.Context, email string) (Account, 
 	return scanAccount(row)
 }
 
+// FindAccountByOwner loads the full account row for a face already known by owner (SSO login).
+// It returns the same fields as FindAccountByEmail, including role/auth_version for issueSession.
+func (s *Store) FindAccountByOwner(ctx context.Context, ownerID string) (Account, error) {
+	row := s.DB.QueryRowContext(ctx, `SELECT owner_id, email, display_name, salt, password_hash, kdf,
+		role, status, auth_version, revision, created_at
+		FROM users WHERE owner_id = ?`, ownerID)
+	return scanAccount(row)
+}
+
 func (s *Store) GetUser(ctx context.Context, ownerID string) (User, error) {
 	row := s.DB.QueryRowContext(ctx, `SELECT owner_id, email, display_name, role, status,
 		auth_version, revision FROM users WHERE owner_id = ?`, ownerID)

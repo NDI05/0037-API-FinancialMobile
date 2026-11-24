@@ -43,6 +43,8 @@ type Server struct {
 	// Gmail is nil unless the Gmail API integration is configured; handlers then answer 503.
 	Gmail             *gmail.Service
 	GmailPushVerifier gmail.PushVerifier
+	// GoogleSSO is the ID-token verifier; nil (or Config.GoogleSSO.Enabled=false) answers 503.
+	GoogleSSO *auth.GoogleVerifier
 	// providerSlots caps concurrent provider calls (inline requests and the recovery worker
 	// together) at 2: provider concurrency must never exceed the configured maximum.
 	providerSlots chan struct{}
@@ -56,8 +58,13 @@ const MaxCategoryProviderConcurrency = 2
 
 func New(s *store.Store, cfg *config.Config, issuer *auth.Issuer, logger *slog.Logger,
 	provider llm.Provider) *Server {
-	return &Server{Store: s, Config: cfg, Issuer: issuer, Log: logger, Now: time.Now, Provider: provider,
-		providerSlots: make(chan struct{}, MaxCategoryProviderConcurrency)}
+	server := &Server{Store: s, Config: cfg, Issuer: issuer, Log: logger, Now: time.Now,
+		Provider: provider, providerSlots: make(chan struct{}, MaxCategoryProviderConcurrency)}
+	if cfg.GoogleSSO.Enabled {
+		server.GoogleSSO = auth.NewGoogleVerifier(cfg.GoogleSSO.ClientID, cfg.GoogleSSO.JWKSURL, nil,
+			nil)
+	}
+	return server
 }
 
 // SetGmail enables the Gmail API endpoints. It is called once during startup; a nil service keeps
@@ -74,6 +81,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("POST /v1/accounts", s.register)
 	mux.HandleFunc("POST /v1/sessions", s.login)
+	mux.HandleFunc("GET /v1/auth/google/nonce", s.googleNonce)
+	mux.HandleFunc("POST /v1/auth/google", s.googleLogin)
+	mux.Handle("POST /v1/auth/google/link", s.authedInactiveAware(s.googleLink))
 	mux.HandleFunc("POST /v1/sessions/refresh", s.refresh)
 	mux.Handle("DELETE /v1/sessions", s.authed(s.logout))
 	mux.Handle("GET /v1/me", s.authed(s.me))
@@ -253,6 +263,16 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 }
 
 func (s *Server) authed(next http.HandlerFunc) http.Handler {
+	return s.authenticate(next, false)
+}
+
+// authedInactiveAware authenticates without collapsing an inactive account into session_stale, so
+// endpoints that must answer 403 account_inactive (Google link) can do so from the handler.
+func (s *Server) authedInactiveAware(next http.HandlerFunc) http.Handler {
+	return s.authenticate(next, true)
+}
+
+func (s *Server) authenticate(next http.HandlerFunc, allowInactive bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
 		if token == "" {
@@ -265,8 +285,19 @@ func (s *Server) authed(next http.HandlerFunc) http.Handler {
 			return
 		}
 		state, err := s.Store.SessionState(r.Context(), claims.SID, claims.Subject)
-		if err != nil || state.RevokedAt != nil || state.Status != "ACTIVE" ||
-			state.AuthVersion != claims.Ver || claims.ExpiresAt == nil ||
+		if err != nil || state.RevokedAt != nil {
+			writeError(w, http.StatusUnauthorized, "session_stale", "Session is no longer active", correlationOf(r))
+			return
+		}
+		if state.Status != "ACTIVE" {
+			if allowInactive {
+				writeError(w, http.StatusForbidden, "account_inactive", "Account is not active", correlationOf(r))
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "session_stale", "Session is no longer active", correlationOf(r))
+			return
+		}
+		if state.AuthVersion != claims.Ver || claims.ExpiresAt == nil ||
 			!claims.ExpiresAt.Time.After(s.Now()) || state.ExpiresAt.Before(s.Now()) {
 			writeError(w, http.StatusUnauthorized, "session_stale", "Session is no longer active", correlationOf(r))
 			return

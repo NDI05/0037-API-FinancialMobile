@@ -30,6 +30,8 @@ type sessionResponse struct {
 	RefreshExpiresAt time.Time `json:"refreshExpiresAt"`
 	DisplayName      string    `json:"displayName"`
 	User             userJSON  `json:"user"`
+	// GoogleLinked is additive and only present on SSO responses (password login keeps its shape).
+	GoogleLinked *bool `json:"googleLinked,omitempty"`
 }
 
 type userJSON struct {
@@ -281,10 +283,15 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 			seen[consent.Purpose] = true
 		}
 	}
+	googleLinked, err := s.Store.GoogleLinked(r.Context(), info.OwnerID)
+	if err != nil {
+		s.databaseOrInternal(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"displayName": nullString(user.DisplayName), "role": user.Role,
 		"consents": items, "status": latest, "lastSummaryAt": nil, "lastAnalysisAt": nil,
-		"deletionInProgress": false,
+		"deletionInProgress": false, "googleLinked": googleLinked,
 	})
 }
 
