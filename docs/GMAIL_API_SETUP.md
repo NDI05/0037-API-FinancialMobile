@@ -190,6 +190,9 @@ panggilan (`watchCalls`/`stopCalls` harus 0 di polling), tanpa id/email/token.
   (AAD terikat owner + purpose + key version).
 - Raw MIME hanya ada di memori selama parsing; Penerima/Merchant dipakai sebagai label,
   sedangkan **Merchant PAN, Customer PAN, No. Referensi tidak** pernah disimpan atau di-log.
+  Parser menolak baris field/PAN/identifier sebagai merchant pada jalur label stacked maupun
+  inline (regresi `TestParseLivinStackedLabelRejectsPANAndFieldLines` dan
+  `TestParseLivinInlineLabelRejectsPANLine`, commit `e19477b`).
 - Tidak ada alamat email penuh, ID Gmail mentah, token, atau isi email di log. `sanitizedRoute`
   memetakan callback/push/dev ke label tetap.
 - Dedupe dilakukan saat impor lewat `source_ref` (`ImportBatch`), bukan lewat panggilan
