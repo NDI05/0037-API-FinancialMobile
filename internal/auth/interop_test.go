@@ -17,7 +17,7 @@ type passwordFixture struct {
 }
 
 func TestVerifyNodePasswordFixture(t *testing.T) {
-	raw, err := os.ReadFile("../../../fixtures/interop/node-password.json")
+	raw, err := os.ReadFile("../../fixtures/interop/node-password.json")
 	if err != nil {
 		t.Fatal(err)
 	}

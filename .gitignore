@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+bin/
+data/
+*.db
+*.db-journal
+*.db-wal
+*.log
+.toolchain/
+coverage.out
+tmp/
+bin/
+.DS_Store

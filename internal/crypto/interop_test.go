@@ -19,7 +19,7 @@ type sealedFixture struct {
 }
 
 func TestOpenNodeSealedFixture(t *testing.T) {
-	raw, err := os.ReadFile("../../../fixtures/interop/node-sealed.json")
+	raw, err := os.ReadFile("../../fixtures/interop/node-sealed.json")
 	if err != nil {
 		t.Fatal(err)
 	}
