@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"sync"
 	"testing"
@@ -723,3 +724,92 @@ func TestLeaseFencingRejectsStaleWorker(t *testing.T) {
 }
 
 func storeKey(merchant string) string { return CacheKey(merchant, "DEBIT", "QRIS") }
+
+// FR-67 late-result matrix: a model result that arrives after the ledger changed must be discarded
+// without touching the row. Deleted records, owner changes and an owner-cancelled job are the cases
+// not covered by the existing revision/consent/deletion-request guards.
+func TestLateClassificationResultDiscardedForLifecycleChanges(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("deleted record", func(t *testing.T) {
+		s, _ := openCategoryStore(t)
+		owner, txID, catID := regOwnerSetup(t, s, "late-deleted@example.test")
+		tx, err := s.GetTransaction(ctx, owner, txID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence := claimFence(t, s, owner, txID, tx.Revision)
+		if _, err := s.DB.ExecContext(ctx,
+			`UPDATE transactions SET deleted_at=? WHERE owner_id=? AND id=?`,
+			nowString(regNow), owner, txID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ApplyLLMCategory(ctx, owner, txID, tx.Revision, fence.ID, fence.LeaseToken,
+			catID, "food", "p", "m", "category-prompt/1", "builtin-categories/1", "r", 0.9,
+			regNow); err == nil {
+			t.Fatal("deleted row accepted a late classification")
+		}
+		var category sql.NullString
+		if err := s.DB.QueryRowContext(ctx, `SELECT category_id FROM transactions WHERE id=?`,
+			txID).Scan(&category); err != nil {
+			t.Fatal(err)
+		}
+		if category.Valid {
+			t.Fatalf("deleted row got category %q", category.String)
+		}
+	})
+
+	t.Run("owner change", func(t *testing.T) {
+		s, _ := openCategoryStore(t)
+		ownerA, txA, catA := regOwnerSetup(t, s, "late-owner-a@example.test")
+		ownerB, _, _ := regOwnerSetup(t, s, "late-owner-b@example.test")
+		tx, err := s.GetTransaction(ctx, ownerA, txA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence := claimFence(t, s, ownerA, txA, tx.Revision)
+		// A result late enough that the session now belongs to another owner must not cross owners.
+		if _, err := s.ApplyLLMCategory(ctx, ownerB, txA, tx.Revision, fence.ID, fence.LeaseToken,
+			catA, "food", "p", "m", "category-prompt/1", "builtin-categories/1", "r", 0.9,
+			regNow); err == nil {
+			t.Fatal("foreign owner applied a classification")
+		}
+		after, err := s.GetTransaction(ctx, ownerA, txA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Revision != tx.Revision || after.CategoryOrigin == "LLM" {
+			t.Fatalf("foreign apply mutated the row: %+v", after)
+		}
+	})
+
+	t.Run("cancelled job", func(t *testing.T) {
+		s, _ := openCategoryStore(t)
+		owner, txID, catID := regOwnerSetup(t, s, "late-cancelled@example.test")
+		tx, err := s.GetTransaction(ctx, owner, txID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence := claimFence(t, s, owner, txID, tx.Revision)
+		if err := s.FinishCategoryJob(ctx, owner, fence.ID, fence.LeaseToken, "CANCELLED", "", "",
+			"", "", "", "", "", 0, regNow); err != nil {
+			t.Fatalf("cancel job: %v", err)
+		}
+		cancelled, err := s.GetCategoryJob(ctx, owner, fence.ID)
+		if err != nil || cancelled.State != "CANCELLED" {
+			t.Fatalf("cancelled job = %+v err=%v", cancelled, err)
+		}
+		if _, err := s.ApplyLLMCategory(ctx, owner, txID, tx.Revision, fence.ID, fence.LeaseToken,
+			catID, "food", "p", "m", "category-prompt/1", "builtin-categories/1", "r", 0.9,
+			regNow); err != ErrLeaseLost {
+			t.Fatalf("late result after cancel: err=%v want ErrLeaseLost", err)
+		}
+		after, err := s.GetTransaction(ctx, owner, txID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Revision != tx.Revision || after.CategoryOrigin == "LLM" {
+			t.Fatalf("cancelled job mutated the row: %+v", after)
+		}
+	})
+}

@@ -361,12 +361,12 @@ func TestOwnerCannotReadForeignJob(t *testing.T) {
 
 func TestClassifyErrorCodeMapping(t *testing.T) {
 	cases := map[error]string{
-		categoryllm.ErrInputTooLarge:      "input_too_large",
-		categoryllm.ErrTruncated:          "truncated",
-		categoryllm.ErrInvalidOutput:      "invalid_output",
-		categoryllm.ErrInvalidInput:       "invalid_input",
-		categoryllm.ErrProviderTransient:  "provider_transient",
-		errors.New("some other failure"):  "provider_error",
+		categoryllm.ErrInputTooLarge:     "input_too_large",
+		categoryllm.ErrTruncated:         "truncated",
+		categoryllm.ErrInvalidOutput:     "invalid_output",
+		categoryllm.ErrInvalidInput:      "invalid_input",
+		categoryllm.ErrProviderTransient: "provider_transient",
+		errors.New("some other failure"): "provider_error",
 	}
 	for err, want := range cases {
 		if got := classifyErrorCode(err); got != want {
@@ -399,6 +399,7 @@ func (c *countingCategory) SplitCandidates(cs []categoryllm.Candidate) [][]categ
 func (c *countingCategory) FitsInputBudget([]categoryllm.Candidate) bool { return true }
 
 var _ = store.ErrNotFound
+
 // An explicit user retry after a terminal provider failure must be able to run again instead of
 // replaying the FAILED job forever, while a NEEDS_REVIEW decision is never re-litigated.
 func TestExplicitRetryAfterFailedJob(t *testing.T) {
@@ -521,8 +522,8 @@ type scriptedCategory struct {
 	split func([]categoryllm.Candidate) [][]categoryllm.Candidate
 }
 
-func (s *scriptedCategory) ID() string    { return "scripted" }
-func (s *scriptedCategory) Model() string { return "scripted-model" }
+func (s *scriptedCategory) ID() string                                   { return "scripted" }
+func (s *scriptedCategory) Model() string                                { return "scripted-model" }
 func (s *scriptedCategory) FitsInputBudget([]categoryllm.Candidate) bool { return true }
 func (s *scriptedCategory) SplitCandidates(c []categoryllm.Candidate) [][]categoryllm.Candidate {
 	if s.split != nil {
@@ -677,8 +678,8 @@ func TestCaseIDMappingHandlesSplitBatches(t *testing.T) {
 // the transaction untouched and write nothing to the cache.
 func TestCaseIDMappingRejectsInvalidSets(t *testing.T) {
 	cases := []struct {
-		name    string
-		order   func([]categoryllm.Result) []categoryllm.Result
+		name  string
+		order func([]categoryllm.Result) []categoryllm.Result
 	}{
 		{"missing", func(r []categoryllm.Result) []categoryllm.Result { return r[:len(r)-1] }},
 		{"duplicate", func(r []categoryllm.Result) []categoryllm.Result {
@@ -843,5 +844,59 @@ func TestReferenceMerchantNeedsReviewWithoutProviderCall(t *testing.T) {
 				t.Fatalf("transaction category changed to %q", got)
 			}
 		})
+	}
+}
+
+// FR-69: results are applied only through a complete caseId mapping, provenance is recorded, and the
+// affected month revision moves so dependent summary/report views are invalidated after ack.
+func TestClassificationRecordsProvenanceAndInvalidatesMonthView(t *testing.T) {
+	stub := &failingCategory{}
+	h := newCategoryHarness(t, stub)
+	h.register("provenance-http@example.test")
+	token, _ := h.login("provenance-http@example.test")
+	grantConsent(t, h, token)
+	txID := classifyBody(t, h, token, "BAKSO PROVENANCE", "QRIS BAKSO",
+		"9"+strings.Repeat("0", 31))
+	_, before := h.request("GET", "/v1/summaries/2026-11", token, nil)
+	beforeRevision := int(before["inputRevision"].(float64))
+
+	status, body := h.request("POST", "/v1/category-jobs", token,
+		map[string]any{"transactionIds": []string{txID}})
+	if status != 200 {
+		t.Fatalf("classify status=%d %v", status, body)
+	}
+	jobs := body["jobs"].([]any)
+	if len(jobs) != 1 {
+		t.Fatalf("jobs=%v", jobs)
+	}
+	job := jobs[0].(map[string]any)
+	if job["state"] != "CLASSIFIED" || job["categoryCode"] != "food" {
+		t.Fatalf("job=%v", job)
+	}
+	if job["provider"] == nil || job["model"] != "stub-model" ||
+		job["promptVersion"] != categoryllm.PromptVersion ||
+		job["taxonomyVersion"] != categoryllm.TaxonomyVersion || job["reasonCode"] != "stub" {
+		t.Fatalf("job provenance=%v", job)
+	}
+	jobID := job["id"].(string)
+
+	// The stored row keeps the same provenance; provider/model are recorded as one rule version.
+	_, tx := h.request("GET", "/v1/transactions/"+txID, token, nil)
+	if tx["categoryOrigin"] != "LLM" || tx["categoryCode"] != "food" ||
+		tx["categoryRuleVersion"] != categoryllm.PromptVersion+"|stub-model" ||
+		tx["categoryTaxonomyVersion"] != categoryllm.TaxonomyVersion ||
+		tx["categoryReason"] != "stub" {
+		t.Fatalf("transaction provenance=%v", tx)
+	}
+	_, stored := h.request("GET", "/v1/category-jobs/"+jobID, token, nil)
+	if stored["provider"] == nil || stored["promptVersion"] != categoryllm.PromptVersion {
+		t.Fatalf("stored job provenance=%v", stored)
+	}
+
+	// Dependent views were invalidated by the applied classification.
+	_, after := h.request("GET", "/v1/summaries/2026-11", token, nil)
+	if int(after["inputRevision"].(float64)) <= beforeRevision ||
+		after["categorizedCount"].(float64) != 1 {
+		t.Fatalf("summary not invalidated: before=%d after=%v", beforeRevision, after)
 	}
 }
