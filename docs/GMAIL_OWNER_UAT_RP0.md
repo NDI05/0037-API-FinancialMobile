@@ -114,8 +114,8 @@ auth/gmail/httpapi/store **PASS**.
 
 Setelah runtime resmi dibangun ulang dari `c98527b` dan dijalankan ulang memakai launcher owner,
 impor live berjalan: ratusan transaksi Livin nyata tersimpan dengan **0 baris duplikat**
-(`source_ref_hash` semua unik), mis. Nov 40/54, Okt 53/86, Agu 55/124 pada snapshot 19:59 WIB dan
-backfill melanjutkan sampai 12/12. Rate limit Google ditangani backoff provider (tidak ada
+(`source_ref_hash` semua unik): **12/12 bulan backfill COMPLETE dengan 914 transaksi unik**
+(mis. Nov 40/54, Okt 53/86, Sep 0 baru/79 duplikat, Agu 55/124, Apr 97/156, Des 2025 144/170). Rate limit Google ditangani backoff provider (tidak ada
 kegagalan permanen). Rincian agregat — tanpa alamat email, nominal, merchant, ID pesan, atau isi
 email — ada di repo Android
 `pam-app/docs/evidence/GMAIL_LIVE_IMPORT_2026-11-24.md`.
