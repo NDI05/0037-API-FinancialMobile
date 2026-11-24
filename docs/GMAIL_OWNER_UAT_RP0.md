@@ -63,6 +63,36 @@ Callback HTTP hanya diterima untuk URL loopback persis di atas pada profil debug
 produksi tetap wajib HTTPS. Backend harus tetap hidup selama UAT dan selama pengujian delta
 otomatis (aplikasi boleh ditutup, backend tidak).
 
+### 3a. UAT alur terkontrol dengan fake provider (bukan bukti Gmail live)
+
+Sebelum kredensial Google asli tersedia, alur server-polling diuji pada HP fisik memakai provider
+palsu (`GMAIL_PROVIDER=fake`) dengan data sintetis. Uji ini membuktikan alur aplikasi, kontrak API,
+backfill bertahap, delta, dan ketahanan restart — **bukan** bukti Gmail live, bukan bukti kuota
+Gmail nyata, dan bukan penutup gate Rp0. Semua akun, email, dan nominal pada fixture sintetis.
+
+Prasyarat: profil privat terpisah `~/.config/pam/gmail-uat-fixture.env` (permission `600`, di luar
+repo) berisi `APP_ENV=development`, `GMAIL_PROVIDER=fake`,
+`GMAIL_ALLOW_LOOPBACK_REDIRECT=true`, `GMAIL_DEV_FIXTURE_FILE=<file JSON sintetis di luar repo>`,
+judul OAuth palsu, database SQLite terpisah, dan `GMAIL_DEV_SCENARIO=normal`. Callback tetap
+`http://127.0.0.1:18090/v1/gmail/connect/callback`; tidak ada kredensial Google asli di profil ini.
+
+1. Jalankan backend fixture, lalu `adb reverse tcp:18090 tcp:18090` untuk HP debug.
+2. Dari Android Studio, Run konfigurasi `app` (debug) pada HP fisik. Pastikan
+   `PAM_BACKEND_BASE_URL=http://127.0.0.1:18090` dan `/readyz` dapat dijangkau dari HP.
+3. Masuk dengan akun uji sintetis, beri consent Gmail di HP, lalu tautkan Gmail. Browser akan
+   membuka halaman consent palsu; setujui dan aplikasi kembali lewat deep link.
+4. Biarkan backfill berjalan bertahap (satu bulan per putaran). Panel status menampilkan
+   "Bulan selesai: N dari 12". Untuk demo, `GMAIL_WORKER_INTERVAL_SECONDS` boleh diperkecil
+   (mis. 10 detik) dan `GMAIL_DELTA_INTERVAL_SECONDS=60`; nilai itu hanya untuk fixture dan
+   **bukan** default produksi (delta produksi 15 menit).
+5. Tutup aplikasi, tambahkan satu pesan sintetis baru ke fixture, jalankan ulang backend. Tunggu
+   delta menulis transaksi baru, lalu buka aplikasi: transaksi muncul tepat satu kali.
+6. Uji "Sinkronkan sekarang", jeda tombol/`429` cooldown, dan restart backend di tengah proses.
+   Catat bahwa transaksi dan cursor tidak hilang serta tidak ada duplikat.
+7. Simpan bukti sebagai label **FIXTURE**: waktu impor, jumlah bulan, jumlah transaksi server vs
+   Ringkasan/Transaksi, jeda delta, dan hasil restart. Jangan pernah mencampur bukti ini dengan
+   klaim Gmail live atau GCP Rp0.
+
 ## 4. Bukti yang diminta saat menutup gate
 
 - Project ID dan status Billing (tidak tertaut) — screenshot konsol boleh, tanpa data pribadi.
