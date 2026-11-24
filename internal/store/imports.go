@@ -85,19 +85,22 @@ func (s *Store) GetImportJob(ctx context.Context, ownerID, id string) (ImportJob
 	return scanImportJob(row)
 }
 
+// ImportBatch stores one import page idempotently. It returns the counts, the ids of transactions
+// newly inserted by this page (so callers can enqueue follow-up work without re-reading rows) and
+// whether an identical page was replayed.
 func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, requestHash string,
-	pageOrdinal int, candidates []ImportCandidate, now time.Time) (ImportBatchCounts, bool, error) {
+	pageOrdinal int, candidates []ImportCandidate, now time.Time) (ImportBatchCounts, []string, bool, error) {
 	if batchKey == "" || len(batchKey) > 200 {
-		return ImportBatchCounts{}, false, fmt.Errorf("batchKey is required")
+		return ImportBatchCounts{}, nil, false, fmt.Errorf("batchKey is required")
 	}
 	if pageOrdinal < 0 || len(candidates) > 100 {
-		return ImportBatchCounts{}, false, fmt.Errorf("batch size is invalid")
+		return ImportBatchCounts{}, nil, false, fmt.Errorf("batch size is invalid")
 	}
 	if len(candidates) == 0 {
-		return ImportBatchCounts{}, false, fmt.Errorf("candidates are empty")
+		return ImportBatchCounts{}, nil, false, fmt.Errorf("candidates are empty")
 	}
 	if err := s.ensureNoDeletion(ctx, ownerID); err != nil {
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	// Resolve the job month before validation so an event outside the job month rejects the whole
 	// page. The job is re-read inside the write transaction after validation.
@@ -105,47 +108,47 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 	if err := s.DB.QueryRowContext(ctx, `SELECT month_id, state FROM import_jobs
 		WHERE owner_id = ? AND id = ?`, ownerID, jobID).Scan(&jobMonth, &initialJobState); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ImportBatchCounts{}, false, ErrNotFound
+			return ImportBatchCounts{}, nil, false, ErrNotFound
 		}
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	// Validate everything before opening a write transaction: an invalid candidate rejects the
 	// entire batch instead of leaving a half-imported page.
 	for _, candidate := range candidates {
 		if err := validateImportCandidate(candidate); err != nil {
-			return ImportBatchCounts{}, false, err
+			return ImportBatchCounts{}, nil, false, err
 		}
 		if err := validateAttributes(candidate.Attributes); err != nil {
-			return ImportBatchCounts{}, false, err
+			return ImportBatchCounts{}, nil, false, err
 		}
 		if candidate.Status == "PARSED" && monthIDFor(candidate.EventAt) != jobMonth {
-			return ImportBatchCounts{}, false, fmt.Errorf("invalid candidate eventAt: outside the import month %s", jobMonth)
+			return ImportBatchCounts{}, nil, false, fmt.Errorf("invalid candidate eventAt: outside the import month %s", jobMonth)
 		}
 		if candidate.SourceRef != "" && !validSourceRef(candidate.SourceRef) {
-			return ImportBatchCounts{}, false, fmt.Errorf("sourceRef has an unsupported form")
+			return ImportBatchCounts{}, nil, false, fmt.Errorf("sourceRef has an unsupported form")
 		}
 		if candidate.CategoryID != "" {
 			if err := s.ensureCategory(ctx, ownerID, candidate.CategoryID); err != nil {
-				return ImportBatchCounts{}, false, err
+				return ImportBatchCounts{}, nil, false, err
 			}
 		}
 	}
 
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	if err := ensureNoDeletionTx(ctx, tx, ownerID); err != nil {
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	var monthID, state string
 	if err := tx.QueryRowContext(ctx, `SELECT month_id, state FROM import_jobs
 		WHERE owner_id = ? AND id = ?`, ownerID, jobID).Scan(&monthID, &state); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ImportBatchCounts{}, false, ErrNotFound
+			return ImportBatchCounts{}, nil, false, ErrNotFound
 		}
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	var existingHash string
 	var existingCounts string
@@ -154,20 +157,21 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 		&existingHash, &existingCounts)
 	if err == nil {
 		if existingHash != requestHash {
-			return ImportBatchCounts{}, false, ErrIdempotencyConflict
+			return ImportBatchCounts{}, nil, false, ErrIdempotencyConflict
 		}
 		var counts ImportBatchCounts
 		_ = json.Unmarshal([]byte(existingCounts), &counts)
-		return counts, true, nil
+		return counts, nil, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	if state != "CREATED" && state != "RUNNING" {
-		return ImportBatchCounts{}, false, fmt.Errorf("import job is already finished")
+		return ImportBatchCounts{}, nil, false, fmt.Errorf("import job is already finished")
 	}
 
 	counts := ImportBatchCounts{Matched: len(candidates)}
+	var importedIDs []string
 	for _, candidate := range candidates {
 		if candidate.Status == "UNRESOLVED" {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO import_skipped
@@ -175,7 +179,7 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 				VALUES (?, ?, ?, ?, ?, ?, ?)`,
 				NewID("skip"), ownerID, jobID, candidate.Reason, pageOrdinal,
 				counts.Skipped, nowString(now)); err != nil {
-				return ImportBatchCounts{}, false, err
+				return ImportBatchCounts{}, nil, false, err
 			}
 			counts.Skipped++
 			continue
@@ -185,7 +189,7 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 			Attributes: candidate.Attributes,
 		}, s.DataKey, s.KeyVersion, ownerID, "transaction")
 		if err != nil {
-			return ImportBatchCounts{}, false, err
+			return ImportBatchCounts{}, nil, false, err
 		}
 		var refCipher, refIV, refTag any
 		var refVersion any
@@ -194,7 +198,7 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 			sealedRef, err := crypto.Seal([]byte(candidate.SourceRef), s.DataKey, s.KeyVersion,
 				ownerID, "source_ref")
 			if err != nil {
-				return ImportBatchCounts{}, false, err
+				return ImportBatchCounts{}, nil, false, err
 			}
 			refCipher, refIV, refTag = sealedRef.Ciphertext, sealedRef.IV, sealedRef.Tag
 			refVersion = s.KeyVersion
@@ -203,6 +207,7 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 		// Two independent identity keys: the device fingerprint and the sealed source reference.
 		// A reparsed notification changes the former (its merchant fields changed), so the latter
 		// is what makes a post-repair re-import a duplicate instead of a new row.
+		transactionID := NewID("tx")
 		result, err := tx.ExecContext(ctx, `INSERT INTO transactions
 			(id, owner_id, category_id, direction, source, amount_minor, currency, event_at_ms,
 			 month_id, fingerprint, parser_version, parser_confidence, category_origin,
@@ -211,17 +216,18 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 			 source_ref_hash, is_internal_transfer, linked_refund_of, revision, created_at, updated_at)
 			VALUES (?, ?, ?, ?, 'EMAIL', ?, 'IDR', ?, ?, ?, ?, ?, 'IMPORTED', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, ?, ?)
 			ON CONFLICT DO NOTHING`,
-			NewID("tx"), ownerID, nullableString(candidate.CategoryID), candidate.Direction,
+			transactionID, ownerID, nullableString(candidate.CategoryID), candidate.Direction,
 			candidate.AmountMinor, candidate.EventAt.UnixMilli(), monthID, candidate.Fingerprint,
 			candidate.ParserVersion, candidate.Confidence, sealed.Ciphertext, sealed.IV, sealed.Tag,
 			s.KeyVersion, refCipher, refIV, refTag, refVersion, refHash,
 			nowString(now), nowString(now))
 		if err != nil {
-			return ImportBatchCounts{}, false, err
+			return ImportBatchCounts{}, nil, false, err
 		}
 		affected, _ := result.RowsAffected()
 		if affected == 1 {
 			counts.Imported++
+			importedIDs = append(importedIDs, transactionID)
 		} else {
 			counts.Duplicates++
 		}
@@ -238,16 +244,16 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 			lookup := s.DB.QueryRowContext(ctx, `SELECT request_hash, counts_json FROM import_batches
 				WHERE owner_id = ? AND job_id = ? AND batch_key = ?`, ownerID, jobID, batchKey)
 			if lookupErr := lookup.Scan(&hash, &stored); lookupErr != nil {
-				return ImportBatchCounts{}, false, lookupErr
+				return ImportBatchCounts{}, nil, false, lookupErr
 			}
 			if hash != requestHash {
-				return ImportBatchCounts{}, false, ErrIdempotencyConflict
+				return ImportBatchCounts{}, nil, false, ErrIdempotencyConflict
 			}
 			var existing ImportBatchCounts
 			_ = json.Unmarshal([]byte(stored), &existing)
-			return existing, true, nil
+			return existing, nil, true, nil
 		}
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE import_jobs SET
 		state = 'RUNNING',
@@ -260,17 +266,17 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 		WHERE owner_id = ? AND id = ?`,
 		pageOrdinal+1, counts.Matched, counts.Imported, counts.Duplicates, counts.Skipped,
 		counts.Unresolved, ownerID, jobID); err != nil {
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
 	if counts.Imported > 0 {
 		if err := bumpMonthRevision(ctx, tx, ownerID, monthID, now); err != nil {
-			return ImportBatchCounts{}, false, err
+			return ImportBatchCounts{}, nil, false, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return ImportBatchCounts{}, false, err
+		return ImportBatchCounts{}, nil, false, err
 	}
-	return counts, false, nil
+	return counts, importedIDs, false, nil
 }
 
 func (s *Store) FinalizeImportJob(ctx context.Context, ownerID, jobID, finalState, errorCode string, now time.Time) (ImportJob, error) {

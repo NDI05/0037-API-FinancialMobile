@@ -65,7 +65,19 @@ Jika belum pernah terhubung: `{"connected": false, ...}` dengan field waktu `nul
 service account env), resolve owner **hanya** lewat koneksi server (email di payload), simpan
 event durable lalu ACK 2xx. Event ganda/terlambat harus idempoten.
 
-## 6. Catatan Android
+## 6. Dampak ke kategorisasi otomatis (tanpa field API baru)
+
+- Setelah batch impor server-side diakui, transaksi baru yang eligible masuk antrean
+  kategorisasi otomatis **tanpa memanggil provider**. Syarat tetap: consent
+  `AI_CATEGORIZATION` `GRANTED`, budget/attempt/token gate durable, dan keputusan kategori
+  manual pengguna menang.
+- Server menjalankan jendela drain terbatas: maks. 5 merchant per request provider, maks. 4
+  request per jendela 2 jam, single-flight per owner (tidak ada dua drain paralel). Antrean
+  kosong = nol panggilan provider.
+- Hasil klasifikasi yang terlambat tidak pernah menulis ke owner lain; kegagalan provider tidak
+  menghapus transaksi. Status/field API tidak berubah — klien tetap memakai kontrak di atas.
+
+## 7. Catatan Android
 
 - App hanya perlu: tombol "Tautkan Gmail" (panggil start, buka URL), deep link
   `pam://gmail/connected`, tampilan status, dan tombol "Putuskan".

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,13 +17,47 @@ import (
 
 var syncNow = time.Date(2026, 11, 24, 6, 0, 0, 0, time.UTC)
 
+// fakeCategories records the server-side category hook calls made by the Gmail worker.
+type fakeCategories struct {
+	mu        sync.Mutex
+	enqueued  [][]string
+	enqueueOK int
+	drains    int
+	err       error
+}
+
+func (f *fakeCategories) EnqueueImported(_ context.Context, _ string, ids []string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	f.enqueued = append(f.enqueued, append([]string(nil), ids...))
+	f.enqueueOK += len(ids)
+	return len(ids), nil
+}
+
+func (f *fakeCategories) DrainOwner(context.Context, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drains++
+	return nil
+}
+
+func (f *fakeCategories) snapshot() (enqueued [][]string, drains int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]string(nil), f.enqueued...), f.drains
+}
+
 type syncFixture struct {
-	Service  *Service
-	Store    *store.Store
-	Provider *FakeProvider
-	OAuth    *FakeExchanger
-	Owner    string
-	Now      time.Time
+	Service    *Service
+	Store      *store.Store
+	Provider   *FakeProvider
+	OAuth      *FakeExchanger
+	Categories *fakeCategories
+	Owner      string
+	Now        time.Time
 }
 
 func newSyncFixture(t *testing.T) *syncFixture {
@@ -48,14 +83,16 @@ func newSyncFixture(t *testing.T) *syncFixture {
 				Expiry: now.Add(time.Hour), Scope: "https://www.googleapis.com/auth/gmail.readonly"},
 		},
 	}
+	categories := &fakeCategories{}
 	service := NewService(data, provider, exchanger, Settings{
 		RedirectURI: "https://api.example.test/v1/gmail/connect/callback",
 		TopicName:   "projects/pam/topics/gmail", BackfillMonths: 1, PageSize: 10,
 		MaxPagesPerRun: 5, WatchRenewBefore: 24 * time.Hour,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	service.Now = func() time.Time { return now }
+	service.Categories = categories
 	return &syncFixture{Service: service, Store: data, Provider: provider, OAuth: exchanger,
-		Owner: store.OwnerIDForEmail("gmail-sync@example.test"), Now: now}
+		Categories: categories, Owner: store.OwnerIDForEmail("gmail-sync@example.test"), Now: now}
 }
 
 func (f *syncFixture) connect(t *testing.T, cursor string) store.GmailConnection {
@@ -298,5 +335,87 @@ func TestServiceRejectsPlaintextSecretsAndMasksEmail(t *testing.T) {
 	disconnected, err := f.Store.GetGmailConnection(ctx, f.Owner)
 	if err != nil || disconnected.State != "DISCONNECTED" || disconnected.RefreshToken != "" {
 		t.Fatalf("disconnect must clear credentials: %+v %v", disconnected, err)
+	}
+}
+
+// Imported pages must start the server-side category window: only newly inserted transaction ids
+// are handed to the hook, a replayed page hands over nothing, and a hook failure never fails an
+// import that the store already acknowledged.
+func TestImportedPagesTriggerCategoryEnqueueOnce(t *testing.T) {
+	ctx := context.Background()
+	f := newSyncFixture(t)
+	f.connect(t, "100")
+	f.Provider.RawByID = map[string]RawMessage{
+		"m1": {ID: "m1", Raw: rawEmail("Pembayaran Berhasil!", livinBodyFor("10 Nov 2026 09:30:45"))},
+		"m2": {ID: "m2", Raw: rawEmail("Pembayaran Berhasil!", livinBodyFor("05 Jan 2026 10:00:00"))},
+	}
+	pages := []MessageList{
+		{Messages: []MessageRef{{ID: "m1"}, {ID: "m2"}}, NextPageToken: "page-2"},
+		{Messages: []MessageRef{{ID: "m1"}}},
+	}
+	f.Provider.Pages = pages
+	if _, err := f.Service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, drains := f.Categories.snapshot()
+	// Page 1 imports m1 (m2 is outside the month); page 2 is a duplicate and enqueues nothing.
+	if len(enqueued) != 1 || len(enqueued[0]) != 1 {
+		t.Fatalf("enqueue calls = %v, want exactly one imported id", enqueued)
+	}
+	var importedID string
+	if err := f.Store.DB.QueryRow(`SELECT id FROM transactions WHERE owner_id = ?`,
+		f.Owner).Scan(&importedID); err != nil {
+		t.Fatal(err)
+	}
+	if enqueued[0][0] != importedID {
+		t.Fatalf("enqueued id = %q, want stored transaction %q", enqueued[0][0], importedID)
+	}
+	if drains != 1 {
+		t.Fatalf("drain calls = %d, want 1", drains)
+	}
+
+	// Replay the same month: no new transaction, hence no new enqueue and no new drain.
+	if _, err := f.Store.DB.Exec(`UPDATE gmail_sync_jobs SET state = 'CREATED',
+		page_token_ciphertext = NULL, page_token_iv = NULL, page_token_tag = NULL,
+		page_token_key_version = NULL
+		WHERE owner_id = ? AND month_id = '2026-11'`, f.Owner); err != nil {
+		t.Fatal(err)
+	}
+	f.Provider.Pages = append(f.Provider.Pages, pages...)
+	if _, err := f.Service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, drains = f.Categories.snapshot()
+	if len(enqueued) != 1 || drains != 1 {
+		t.Fatalf("replayed import enqueued=%v drains=%d, want no new work", enqueued, drains)
+	}
+	if got := f.transactionCount(t); got != 1 {
+		t.Fatalf("replay doubled transactions: %d", got)
+	}
+}
+
+// A category-hook failure is logged and left to the durable category worker; it must not turn an
+// acknowledged import into a sync failure or drop the imported rows.
+func TestCategoryHookFailureDoesNotFailImport(t *testing.T) {
+	ctx := context.Background()
+	f := newSyncFixture(t)
+	f.connect(t, "100")
+	f.Categories.err = errors.New("category store unavailable")
+	f.Provider.RawByID = map[string]RawMessage{
+		"m1": {ID: "m1", Raw: rawEmail("Pembayaran Berhasil!", livinBodyFor("10 Nov 2026 09:30:45"))},
+	}
+	f.Provider.Pages = []MessageList{{Messages: []MessageRef{{ID: "m1"}}}}
+	report, err := f.Service.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("hook failure must not fail the sync run: %v", err)
+	}
+	if report.Failures != 0 {
+		t.Fatalf("hook failure must not count as a sync failure: %+v", report)
+	}
+	if got := f.transactionCount(t); got != 1 {
+		t.Fatalf("imported rows = %d, want 1", got)
+	}
+	if _, drains := f.Categories.snapshot(); drains != 0 {
+		t.Fatalf("drain must not run when enqueue failed: %d", drains)
 	}
 }

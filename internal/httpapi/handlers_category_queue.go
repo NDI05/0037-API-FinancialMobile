@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/categoryllm"
@@ -111,6 +112,17 @@ func (s *Server) enqueueCategoryJobs(w http.ResponseWriter, r *http.Request) {
 // window it runs up to CategoryDrainMaxBatches batches of at most CategoryDrainBatch unique
 // merchants, and the remainder is deferred to the next window.
 func (s *Server) drainOwnerQueue(ctx context.Context, ownerID string, now time.Time, ignoreDue bool) (drainOutcome, error) {
+	unlock, ok := s.acquireOwnerDrain(ownerID)
+	if !ok {
+		// Another drain owns this owner's window (HTTP poll, recovery worker or the Gmail import
+		// trigger). Answering not_due keeps the poll cheap and prevents overlapping provider spend.
+		pending, err := s.Store.CountQueuedCategoryJobs(ctx, ownerID)
+		if err != nil {
+			return drainOutcome{State: "not_due"}, err
+		}
+		return drainOutcome{State: "not_due", Pending: pending}, nil
+	}
+	defer unlock()
 	out := drainOutcome{State: "drained"}
 	pending, err := s.Store.CountQueuedCategoryJobs(ctx, ownerID)
 	if err != nil {
@@ -309,6 +321,88 @@ func (s *Server) applyCachedQueuedJobs(ctx context.Context, ownerID string, now 
 	return applied, nil
 }
 
+// acquireOwnerDrain serializes one owner's drain window across every trigger. A second caller is
+// told not_due instead of stacking provider requests for the same queue.
+func (s *Server) acquireOwnerDrain(ownerID string) (func(), bool) {
+	value, _ := s.drainLocks.LoadOrStore(ownerID, &sync.Mutex{})
+	mutex := value.(*sync.Mutex)
+	if !mutex.TryLock() {
+		return nil, false
+	}
+	return mutex.Unlock, true
+}
+
+// EnqueueImported is the server-side enqueue hook used by the Gmail sync worker after an
+// acknowledged import page. It mirrors the HTTP enqueue gate exactly: classifier enabled, explicit
+// AI_CATEGORIZATION consent, eligibility re-checked from stored rows, and no provider call.
+func (s *Server) EnqueueImported(ctx context.Context, ownerID string,
+	transactionIDs []string) (int, error) {
+	if !s.autoCategoryEnabled() || !s.autoCategoryConsentGranted(ctx, ownerID) || len(transactionIDs) == 0 {
+		return 0, nil
+	}
+	now := s.Now()
+	dueAt := now
+	if state, err := s.Store.CategoryQueueStateFor(ctx, ownerID); err == nil &&
+		state.NextDrainAt != nil && state.NextDrainAt.After(now) {
+		dueAt = *state.NextDrainAt
+	}
+	seen := map[string]bool{}
+	queued := 0
+	for _, id := range transactionIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		tx, err := s.Store.GetTransaction(ctx, ownerID, id)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				continue // owner isolation: an id from another owner is never enqueued
+			}
+			return queued, err
+		}
+		if !autoCategoryEligible(tx) {
+			continue
+		}
+		key, ok := merchantKeyFor(tx)
+		if !ok {
+			continue
+		}
+		inserted, err := s.Store.EnqueueAutoCategoryJob(ctx, ownerID, tx.ID, tx.Revision, key,
+			dueAt, now)
+		if err != nil {
+			return queued, err
+		}
+		if inserted {
+			queued++
+		}
+	}
+	// Apply already-known merchant results without touching the provider, so a backfill batch that
+	// repeats a cached merchant is finished in the same pass instead of waiting for a window.
+	if _, err := s.applyCachedQueuedJobs(ctx, ownerID, now, CategoryCacheFanoutLimit); err != nil {
+		return queued, err
+	}
+	return queued, nil
+}
+
+// DrainOwner runs one bounded server-side window after a Gmail import. It reuses the
+// HTTP drain semantics: CategoryDrainBatch merchants per request, CategoryDrainMaxBatches requests,
+// the durable 2-hour window, budget/attempt/token gates and single-flight per owner. An early call
+// does not spend provider budget; the durable CategoryWorker still retries later if it does not fit.
+func (s *Server) DrainOwner(ctx context.Context, ownerID string) error {
+	if !s.autoCategoryEnabled() || !s.autoCategoryConsentGranted(ctx, ownerID) {
+		return nil
+	}
+	out, err := s.drainOwnerQueue(ctx, ownerID, s.Now(), false)
+	if err != nil {
+		return err
+	}
+	if out.Drained > 0 || out.State == "budget_exhausted" {
+		s.Log.Info("category window", "trigger", "gmail", "state", out.State, "drained", out.Drained,
+			"pending", out.Pending)
+	}
+	return nil
+}
+
 func drainResponse(state string, drained, pending int, next *time.Time, jobs []categoryJobJSON) map[string]any {
 	body := map[string]any{"state": state, "drained": drained, "pending": pending}
 	if next != nil {
@@ -329,7 +423,13 @@ func (s *Server) autoCategoryConsented(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-	consent, err := s.Store.LatestConsent(r.Context(), info.OwnerID, "AI_CATEGORIZATION")
+	return s.autoCategoryConsentGranted(r.Context(), info.OwnerID)
+}
+
+// autoCategoryConsentGranted is the session-free consent check shared by the HTTP endpoints and the
+// server-side Gmail import trigger: without an explicit GRANTED decision nothing is enqueued.
+func (s *Server) autoCategoryConsentGranted(ctx context.Context, ownerID string) bool {
+	consent, err := s.Store.LatestConsent(ctx, ownerID, "AI_CATEGORIZATION")
 	return err == nil && consent.Decision == "GRANTED"
 }
 

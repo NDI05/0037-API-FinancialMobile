@@ -98,7 +98,13 @@ Validasi production menolak konfigurasi Gmail yang tidak lengkap dan redirect UR
    diakui; percobaan ulang tidak menggandakan transaksi (dedupe per owner + source ref).
 5. **Delta kedaluwarsa** (404/`history.list` invalid): scan ulang bulan berjalan (aman karena
    dedupe), ambil cursor baru dari `users.getProfile`, lanjut.
-6. **Disconnect** (`POST /v1/gmail/disconnect`): stop watch, revoke token bila mungkin, hapus
+6. **Kategorisasi otomatis ikut jalan**: setelah satu batch impor diakui, worker hanya
+   meng-enqueue transaksi yang benar-benar baru (dengan consent `AI_CATEGORIZATION` GRANTED)
+   tanpa memanggil provider, lalu menjalankan satu jendela drain server-side yang dibatasi
+   (konstanta `CategoryDrainBatch` = 5 merchant/request, `CategoryDrainMaxBatches` = 4 request
+   per jendela 2 jam, single-flight per owner). Budget/attempt/token gate tetap berlaku dan
+   penolakan budget tidak menghapus transaksi. Idempoten: replay batch tidak menambah job.
+7. **Disconnect** (`POST /v1/gmail/disconnect`): stop watch, revoke token bila mungkin, hapus
    kredensial tersimpan, tolak pekerjaan baru. Transaksi yang sudah dikonfirmasi tidak dihapus.
 
 ## 5. Keamanan dan batas data
@@ -123,7 +129,8 @@ export PAM_GOROOT=/path/to/go1.27.4
 Tes memakai `FakeProvider`, `FakeExchanger`, dan `FakePushVerifier` — tanpa jaringan, tanpa
 kredensial. Yang dicakup: state replay/expired, PKCE, isolasi owner, token terenkripsi,
 push JWT salah/benar, idempotensi event, dedupe, filter periode, cursor kedaluwarsa, retry,
-dan renewal watch.
+renewal watch, serta jembatan kategorisasi (enqueue hanya baris baru + consent, drain
+terbatas/single-flight, budget tidak menghapus transaksi).
 
 ## 7. Gate yang belum dijalankan (menunggu owner)
 

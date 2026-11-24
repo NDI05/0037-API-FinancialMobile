@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/auth"
@@ -45,6 +46,9 @@ type Server struct {
 	// providerSlots caps concurrent provider calls (inline requests and the recovery worker
 	// together) at 2: provider concurrency must never exceed the configured maximum.
 	providerSlots chan struct{}
+	// drainLocks is the per-owner single-flight for category drain windows; it is not tied to a
+	// session so HTTP polls, the recovery worker and the Gmail import trigger share it.
+	drainLocks sync.Map
 }
 
 // MaxCategoryProviderConcurrency is the enforced ceiling on simultaneous provider calls.

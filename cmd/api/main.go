@@ -103,6 +103,9 @@ func run() error {
 			ServiceAccount: cfg.Gmail.PushServiceAccount,
 			JWKSURL:        cfg.Gmail.JWKSURL,
 		})
+		// The Gmail worker imports server-side, so it must be the one that starts the automatic
+		// categorization window: the Android client cannot know about backfilled rows.
+		gmailService.Categories = api
 		api.SetGmail(gmailService, verifier)
 		gmailCoordinator = &gmail.Coordinator{Service: gmailService, Interval: cfg.Gmail.WorkerInterval,
 			Log: logger}

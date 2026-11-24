@@ -69,6 +69,15 @@ func (s Settings) withDefaults() Settings {
 }
 
 // Service owns the OAuth connect flow and the sync coordinator.
+// CategoryEnqueuer is the optional server-side hook that turns freshly imported transactions into
+// automatic categorization work. EnqueueImported must be provider-free; DrainOwner runs one
+// bounded, single-flight window and may call the classifier. A hook error never rolls back an
+// acknowledged import.
+type CategoryEnqueuer interface {
+	EnqueueImported(ctx context.Context, ownerID string, transactionIDs []string) (int, error)
+	DrainOwner(ctx context.Context, ownerID string) error
+}
+
 type Service struct {
 	Store    *store.Store
 	Provider Provider
@@ -76,6 +85,9 @@ type Service struct {
 	Settings Settings
 	Log      *slog.Logger
 	Now      func() time.Time
+	// Categories is wired during startup when automatic categorization is enabled; nil keeps the
+	// Gmail worker import-only.
+	Categories CategoryEnqueuer
 }
 
 func NewService(data *store.Store, provider Provider, exchanger TokenExchanger, settings Settings,

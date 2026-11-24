@@ -103,7 +103,7 @@ func (s *Server) importBatch(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	requestHash := store.HashImportBatch(job.MonthID, body.BatchKey, body.PageOrdinal, candidates)
-	counts, replayed, err := s.Store.ImportBatch(r.Context(), info.OwnerID, jobID, body.BatchKey,
+	counts, _, replayed, err := s.Store.ImportBatch(r.Context(), info.OwnerID, jobID, body.BatchKey,
 		requestHash, body.PageOrdinal, candidates, s.Now())
 	if err != nil {
 		s.mapWriteError(w, r, err)

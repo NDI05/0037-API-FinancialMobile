@@ -183,9 +183,9 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 			return pageProgress{}, err
 		}
 		if len(candidates) > 0 {
-			counts, _, err := s.Store.ImportBatch(ctx, connection.OwnerID, importJob.ID,
-				fmt.Sprintf("%s:p%d", prefix, pages), candidatesRequestHash(candidates), pages,
-				candidates, now)
+			counts, importedIDs, _, err := s.Store.ImportBatch(ctx, connection.OwnerID,
+				importJob.ID, fmt.Sprintf("%s:p%d", prefix, pages),
+				candidatesRequestHash(candidates), pages, candidates, now)
 			if err != nil {
 				s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "FAILED", "import_failed")
 				return pageProgress{}, err
@@ -194,6 +194,7 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 			progress.Imported += counts.Imported
 			progress.Duplicates += counts.Duplicates
 			progress.Skipped += counts.Skipped
+			s.autoCategorize(ctx, connection.OwnerID, importedIDs)
 		}
 		progress.NextToken = list.NextPageToken
 		if err := checkpoint(progress); err != nil {
@@ -221,6 +222,28 @@ func (s *Service) finalizeMonthJob(ctx context.Context, ownerID, jobID string,
 	if _, err := s.Store.FinalizeImportJob(ctx, ownerID, jobID, state, errorCode, s.Now()); err != nil {
 		s.Log.Warn("gmail_import_finalize_failed", "state", state)
 	}
+}
+
+// autoCategorize hands newly imported transactions to the server-side category pipeline: enqueue
+// is provider-free, the drain is bounded and single-flight. A failure here is logged and retried by
+// the durable category window; the import stays acknowledged either way.
+func (s *Service) autoCategorize(ctx context.Context, ownerID string, transactionIDs []string) {
+	if s.Categories == nil || len(transactionIDs) == 0 {
+		return
+	}
+	queued, err := s.Categories.EnqueueImported(ctx, ownerID, transactionIDs)
+	if err != nil {
+		s.Log.Warn("gmail_category_enqueue_failed")
+		return
+	}
+	if queued == 0 {
+		return
+	}
+	if err := s.Categories.DrainOwner(ctx, ownerID); err != nil {
+		s.Log.Warn("gmail_category_drain_failed")
+		return
+	}
+	s.Log.Info("gmail_category_window", "queued", queued)
 }
 
 // importHistoryMessages parses history message ids, groups them by WIB month and imports each
@@ -260,8 +283,8 @@ func (s *Service) importHistoryMessages(ctx context.Context, connection store.Gm
 				end = len(candidates)
 			}
 			chunk := candidates[start:end]
-			counts, _, err := s.Store.ImportBatch(ctx, connection.OwnerID, importJob.ID,
-				fmt.Sprintf("delta:%s:%d", importJob.ID, start/100),
+			counts, importedIDs, _, err := s.Store.ImportBatch(ctx, connection.OwnerID,
+				importJob.ID, fmt.Sprintf("delta:%s:%d", importJob.ID, start/100),
 				candidatesRequestHash(chunk), start/100, chunk, now)
 			if err != nil {
 				s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID,
@@ -269,6 +292,7 @@ func (s *Service) importHistoryMessages(ctx context.Context, connection store.Gm
 				return err
 			}
 			seen += counts.Matched
+			s.autoCategorize(ctx, connection.OwnerID, importedIDs)
 		}
 		state := "COMPLETE"
 		if seen == 0 {
