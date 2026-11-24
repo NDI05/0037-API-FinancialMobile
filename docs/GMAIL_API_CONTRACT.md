@@ -143,7 +143,7 @@ klien lama; Android wajib memakai field/endpoint baru untuk UAT HP fisik.
     "phase": "backfill",
     "month": "2026-11",
     "months_done": 2,
-    "months_total": 12,
+    "months_total": 13,
     "pages_done": 3
   }
 }
@@ -152,6 +152,9 @@ klien lama; Android wajib memakai field/endpoint baru untuk UAT HP fisik.
 - `needs_reauth=true` berarti grant dicabut/token tidak dapat diperbarui; Android menampilkan
   CTA **Tautkan ulang Gmail** ke layar kontrak §1–§2.
 - `sync_state` tetap `idle|backfill|delta|error`; `progress` boleh `null` saat idle.
+- `months_total` adalah jumlah bulan WIB dalam window NFR-15: 12 bulan rolling, ditambah bulan
+  parsial tertua bila window mulai di tengah bulan (FR-16 "including any partial first month"),
+  sehingga nilainya 12 atau 13. `months_done` menghitung bulan yang job backfill-nya sudah COMPLETE.
 - Semua waktu UTC RFC3339; UI memformat WIB. Endpoint tidak pernah mengembalikan email penuh,
   token, ID pesan, atau isi email.
 

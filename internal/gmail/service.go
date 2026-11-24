@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pam/recap/backend-go/internal/retention"
 	"github.com/pam/recap/backend-go/internal/store"
 )
 
@@ -386,7 +387,7 @@ func (s *Service) Status(ctx context.Context, ownerID string) (StatusView, error
 // restart and never needs an in-memory counter.
 func (s *Service) progress(ctx context.Context, connection store.GmailConnection,
 	now time.Time) SyncProgress {
-	months := rollingMonths(now, s.Settings.BackfillMonths)
+	months := s.backfillMonths(now)
 	progress := SyncProgress{Phase: "idle", Month: monthOf(now), MonthsTotal: len(months)}
 	if len(months) > 0 {
 		since, _ := monthWindow(months[len(months)-1])
@@ -933,6 +934,27 @@ func shiftMonth(month string, delta int) string {
 	return parsed.AddDate(0, delta, 0).Format("2006-01")
 }
 
+// backfillMonths is the initial-history scan set: the configured rolling WIB months, plus the month
+// that contains the NFR-15 window start when that window begins before the oldest month's first
+// day. FR-16 requires the initial history to cover the same rolling one-year window as NFR-15,
+// including that partial first month; without the extra month the first few days of the window
+// would never be queried. Callers still validate every parsed event with the exact window, so the
+// extra month is partially retained rather than fully imported.
+func (s *Service) backfillMonths(now time.Time) []string {
+	months := rollingMonths(now, s.Settings.BackfillMonths)
+	if len(months) == 0 {
+		return months
+	}
+	oldestStart, _ := monthWindow(months[len(months)-1])
+	windowStart := retention.NewWindow(now).Start
+	if windowStart.Before(oldestStart) {
+		if extra := monthOf(windowStart); extra != "" {
+			months = append(months, extra)
+		}
+	}
+	return months
+}
+
 // rollingMonths returns the last N WIB months, newest first.
 func rollingMonths(now time.Time, count int) []string {
 	current := monthOf(now)
@@ -965,7 +987,7 @@ func (s *Service) BackfillPending(ctx context.Context, ownerID string, now time.
 
 func (s *Service) backfillPending(ctx context.Context, connection store.GmailConnection,
 	now time.Time) bool {
-	months := rollingMonths(now, s.Settings.BackfillMonths)
+	months := s.backfillMonths(now)
 	if len(months) == 0 {
 		return false
 	}
@@ -984,7 +1006,7 @@ func (s *Service) backfillPending(ctx context.Context, connection store.GmailCon
 
 func (s *Service) nextBackfillMonth(ctx context.Context, connection store.GmailConnection,
 	now time.Time) (string, bool) {
-	months := rollingMonths(now, s.Settings.BackfillMonths)
+	months := s.backfillMonths(now)
 	if len(months) == 0 {
 		return "", false
 	}

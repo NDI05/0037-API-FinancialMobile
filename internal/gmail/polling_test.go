@@ -59,7 +59,7 @@ func newPollingFixture(t *testing.T, backfillMonths int) *syncFixture {
 func (f *syncFixture) completeBackfill(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
-	for _, month := range rollingMonths(f.Now, f.Service.Settings.BackfillMonths) {
+	for _, month := range f.Service.backfillMonths(f.Now) {
 		start, end := monthWindow(month)
 		job, err := f.Store.EnsureGmailBackfillJob(ctx, f.Owner, month, start, end, f.Now)
 		if err != nil {
@@ -122,8 +122,9 @@ func TestPollingIdleOwnerMakesZeroProviderCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.SyncState != "idle" || status.Progress.MonthsDone != 12 ||
-		status.Progress.MonthsTotal != 12 || status.NextSyncAt.IsZero() {
+	months := f.Service.backfillMonths(f.Now)
+	if status.SyncState != "idle" || status.Progress.MonthsDone != len(months) ||
+		status.Progress.MonthsTotal != len(months) || status.NextSyncAt.IsZero() {
 		t.Fatalf("idle status = %#v", status)
 	}
 }

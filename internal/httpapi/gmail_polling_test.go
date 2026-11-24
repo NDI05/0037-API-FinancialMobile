@@ -112,7 +112,7 @@ func TestGmailPollingSyncQueueStatusAndPushAbsence(t *testing.T) {
 		t.Fatalf("connected polling status = %d %#v", status, body)
 	}
 	progress, ok := body["progress"].(map[string]any)
-	if !ok || progress["months_total"].(float64) != 12 {
+	if !ok || progress["months_total"].(float64) < 12 || progress["months_total"].(float64) > 13 {
 		t.Fatalf("progress = %#v", body["progress"])
 	}
 	for _, field := range []string{"last_attempt_at", "last_success_at", "next_sync_at",
@@ -274,4 +274,118 @@ func TestGmailSyncRejectedWhenNeedsReauth(t *testing.T) {
 	if status != 409 || body["code"] != "gmail_needs_reauth" || body["retryable"] != false {
 		t.Fatalf("needs_reauth sync = %d %#v", status, body)
 	}
+}
+
+// FR-79: the Status pembaruan sheet needs the last attempt and the last success as separate
+// timestamps, and opening it must never start a sync by itself. A manual sync is an asynchronous,
+// durable, coalescing request: repeated taps inside the cooldown get an explicit retry hint, and a
+// request that overlaps an already queued delta is acknowledged as coalesced instead of queued twice.
+func TestGmailStatusAttemptSuccessSeparationAndManualSyncSemantics(t *testing.T) {
+	h := newGmailPollingHarness(t, false)
+	h.register("sheet@example.test")
+	token, _ := h.login("sheet@example.test")
+	ownerID := ownerIDForEmail(t, h.harness, "sheet@example.test")
+	ctx := context.Background()
+
+	startStatus, start := h.request("POST", "/v1/gmail/connect/start", token, map[string]any{})
+	if startStatus != 200 {
+		t.Fatalf("start = %d %#v", startStatus, start)
+	}
+	parsed, err := url.Parse(start["authorization_url"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback, _ := h.rawRoundTrip("GET", "/v1/gmail/connect/callback?code=code-good&state="+
+		url.QueryEscape(parsed.Query().Get("state")), nil, nil)
+	if callback.StatusCode != 302 {
+		t.Fatalf("callback = %d", callback.StatusCode)
+	}
+
+	successAt := time.Date(2026, 11, 24, 3, 0, 0, 0, time.UTC)
+	attemptAt := successAt.Add(2 * time.Hour)
+	if err := h.store.RecordGmailSuccess(ctx, ownerID, successAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.RecordGmailAttempt(ctx, ownerID, attemptAt); err != nil {
+		t.Fatal(err)
+	}
+
+	type syncSnapshot struct {
+		lastAttempt, lastSuccess string
+		jobs, providerCalls      int
+	}
+	snapshot := func() syncSnapshot {
+		var snap syncSnapshot
+		if err := h.store.DB.QueryRowContext(ctx, `SELECT COALESCE(last_attempt_at,''),
+			COALESCE(last_success_at,'') FROM gmail_connections WHERE owner_id = ?`,
+			ownerID).Scan(&snap.lastAttempt, &snap.lastSuccess); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM gmail_sync_jobs
+			WHERE owner_id = ?`, ownerID).Scan(&snap.jobs); err != nil {
+			t.Fatal(err)
+		}
+		snap.providerCalls = h.provider.ListCalls + h.provider.HistoryCalls
+		return snap
+	}
+	before := snapshot()
+
+	for i := 0; i < 3; i++ {
+		status, body := h.request("GET", "/v1/gmail/status", token, nil)
+		if status != 200 || body["connected"] != true {
+			t.Fatalf("status %d = %d %#v", i, status, body)
+		}
+		if body["last_attempt_at"] == nil || body["last_success_at"] == nil ||
+			body["next_sync_at"] == nil {
+			t.Fatalf("status timestamps missing: %#v", body)
+		}
+		attempt, err := time.Parse(time.RFC3339Nano, body["last_attempt_at"].(string))
+		if err != nil {
+			t.Fatalf("last_attempt_at parse: %v", err)
+		}
+		success, err := time.Parse(time.RFC3339Nano, body["last_success_at"].(string))
+		if err != nil {
+			t.Fatalf("last_success_at parse: %v", err)
+		}
+		if !attempt.Equal(attemptAt) || !success.Equal(successAt) {
+			t.Fatalf("attempt/success = %v/%v, want %v/%v", attempt, success, attemptAt, successAt)
+		}
+		if !attempt.After(success) {
+			t.Fatalf("last_attempt_at %v must differ from last_success_at %v", attempt, success)
+		}
+		next, err := time.Parse(time.RFC3339Nano, body["next_sync_at"].(string))
+		if err != nil || !next.Equal(attemptAt.Add(15*time.Minute)) {
+			t.Fatalf("next_sync_at = %v err=%v", next, err)
+		}
+	}
+	if after := snapshot(); after != before {
+		t.Fatalf("GET /v1/gmail/status changed sync state: before=%v after=%v", before, after)
+	}
+
+	// Manual sync at the recorded attempt time queues exactly one durable delta job.
+	h.service.Now = func() time.Time { return attemptAt }
+	status, first := h.request("POST", "/v1/gmail/sync", token, nil)
+	if status != 202 || first["queued"] != true || first["coalesced"] != false {
+		t.Fatalf("first manual sync = %d %#v", status, first)
+	}
+	// A second tap while the cooldown is active is refused with a retry hint, not queued twice.
+	status, cooldown := h.request("POST", "/v1/gmail/sync", token, nil)
+	if status != 429 || cooldown["code"] != "sync_cooldown" {
+		t.Fatalf("cooldown = %d %#v", status, cooldown)
+	}
+	// After the cooldown, a request that overlaps the still-open delta is acknowledged as coalesced.
+	h.service.Now = func() time.Time { return attemptAt.Add(2 * time.Minute) }
+	status, second := h.request("POST", "/v1/gmail/sync", token, nil)
+	if status != 202 || second["queued"] != true || second["coalesced"] != true {
+		t.Fatalf("coalesced sync = %d %#v", status, second)
+	}
+	var deltaJobs int
+	if err := h.store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM gmail_sync_jobs
+		WHERE owner_id = ? AND kind = 'DELTA'`, ownerID).Scan(&deltaJobs); err != nil {
+		t.Fatal(err)
+	}
+	if deltaJobs != 1 {
+		t.Fatalf("delta jobs = %d, want 1 (coalesced, not duplicated)", deltaJobs)
+	}
+	h.service.Now = time.Now
 }

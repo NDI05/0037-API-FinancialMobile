@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pam/recap/backend-go/internal/retention"
 	"github.com/pam/recap/backend-go/internal/store"
 )
 
@@ -179,11 +180,11 @@ func (s *Service) recoverHistory(ctx context.Context, connection store.GmailConn
 		}
 		baseline = profile.HistoryID
 	}
-	months := rollingMonths(now, s.Settings.BackfillMonths)
+	months := s.backfillMonths(now)
 	if len(months) == 0 {
 		return nil
 	}
-	retentionStart, _ := monthWindow(months[len(months)-1])
+	retentionStart := retention.NewWindow(now).Start
 	rangeStart := connection.LastSuccessAt
 	if rangeStart.IsZero() {
 		rangeStart = connection.LastAttemptAt
@@ -396,7 +397,9 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 	// A resumed run starts at page ordinal zero with a different page token; folding the token into
 	// the batch key keeps ImportBatch replay detection from comparing two different pages.
 	prefix = prefix + ":" + shortTokenHash(startToken)
-	retention := rollingMonthSet(now, s.Settings.BackfillMonths)
+	months := s.backfillMonths(now)
+	window := retention.NewWindow(now)
+	retention := monthSet(months)
 	extraJobs := map[string]string{}
 	extraSeen := map[string]int{}
 	progress := pageProgress{NextToken: startToken}
@@ -417,7 +420,7 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 			return pageProgress{}, err
 		}
 		if len(placements) > 0 {
-			groups, order := routePlacements(placements, month, retention)
+			groups, order := routePlacements(placements, month, retention, window)
 			for _, target := range order {
 				candidates := groups[target]
 				jobID := importJob.ID
@@ -475,36 +478,48 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 	return progress, nil
 }
 
-// rollingMonthSet is the retention window used to accept a late notification for an older
-// transaction. Anything outside it gets an explicit rejection instead of a silent drop.
-func rollingMonthSet(now time.Time, months int) map[string]bool {
-	retention := map[string]bool{}
-	for _, month := range rollingMonths(now, months) {
-		retention[month] = true
+// monthSet is the retention window used to accept a late notification for an older transaction.
+// Anything outside it gets an explicit rejection instead of a silent drop.
+func monthSet(months []string) map[string]bool {
+	set := map[string]bool{}
+	for _, month := range months {
+		set[month] = true
 	}
-	return retention
+	return set
+}
+
+// outsideRetention turns a parsed candidate into an auditable skip. Source identity is preserved so
+// a later run that widens the window can still recognise the row.
+func outsideRetention(candidate store.ImportCandidate) store.ImportCandidate {
+	return store.ImportCandidate{
+		Fingerprint:   candidate.Fingerprint,
+		SourceRef:     candidate.SourceRef,
+		Status:        "UNRESOLVED",
+		Reason:        "outside_retention",
+		ParserVersion: TemplateVersion,
+	}
 }
 
 // routePlacements groups parsed candidates by their transaction month. The scanning month stays
 // first so the normal path is deterministic; other in-window months are imported into their own
-// job; out-of-window rows stay in the scanning page as UNRESOLVED so the skip is auditable.
+// job; rows outside the exact NFR-15 window stay in the scanning page as UNRESOLVED so the skip is
+// auditable. The exact check matters for the partially retained oldest month, whose days before
+// Window.Start must not be offered to ImportBatch (validator rejects the whole page).
 func routePlacements(placements []candidatePlacement, scanningMonth string,
-	retention map[string]bool) (map[string][]store.ImportCandidate, []string) {
+	retentionMonths map[string]bool, window retention.Window) (map[string][]store.ImportCandidate, []string) {
 	groups := map[string][]store.ImportCandidate{}
 	order := []string{}
 	for _, placement := range placements {
 		candidate := placement.candidate
 		target := scanningMonth
-		if candidate.Status == "PARSED" && placement.month != "" && placement.month != scanningMonth {
-			if retention[placement.month] {
-				target = placement.month
-			} else {
-				candidate = store.ImportCandidate{
-					Fingerprint:   candidate.Fingerprint,
-					SourceRef:     candidate.SourceRef,
-					Status:        "UNRESOLVED",
-					Reason:        "outside_retention",
-					ParserVersion: TemplateVersion,
+		if candidate.Status == "PARSED" {
+			if !window.Contains(candidate.EventAt) {
+				candidate = outsideRetention(candidate)
+			} else if placement.month != "" && placement.month != scanningMonth {
+				if retentionMonths[placement.month] {
+					target = placement.month
+				} else {
+					candidate = outsideRetention(candidate)
 				}
 			}
 		}

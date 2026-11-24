@@ -14,6 +14,7 @@ import (
 
 	"github.com/pam/recap/backend-go/internal/config"
 	"github.com/pam/recap/backend-go/internal/crypto"
+	"github.com/pam/recap/backend-go/internal/retention"
 	"github.com/pam/recap/backend-go/internal/store"
 )
 
@@ -827,5 +828,152 @@ func TestRecoveryResumesFromCheckpoint(t *testing.T) {
 	}
 	if got := f.transactionCount(t); got != 2 {
 		t.Fatalf("recovery imported %d rows, want 2", got)
+	}
+}
+
+// FR-16/NFR-15: the initial history must cover exactly the rolling one-year WIB window, including
+// the partial month that contains the window start. The boundary is an instant, not a month: the
+// first retained nanosecond counts, one nanosecond earlier does not, and a leap-day start clamps to
+// February 28 of the previous year.
+func TestBackfillMonthsCoverPartialFirstMonthOfRetentionWindow(t *testing.T) {
+	service := &Service{Settings: Settings{BackfillMonths: 12}}
+	start := time.Date(2025, 11, 24, 0, 0, 0, 0, retentionJakarta(t))
+	if !start.Equal(time.Date(2025, 11, 23, 17, 0, 0, 0, time.UTC)) {
+		t.Fatalf("test expectation: 2025-11-24 00:00 WIB = %v", start)
+	}
+	now := syncNow
+	months := service.backfillMonths(now)
+	if len(months) != 13 || months[len(months)-1] != "2025-11" {
+		t.Fatalf("backfill months = %v, want 13 ending at 2025-11", months)
+	}
+	window := retentionWindow(now)
+	if !window.Start.Equal(start) {
+		t.Fatalf("window start = %v, want %v", window.Start, start)
+	}
+	if !window.End.Equal(now) {
+		t.Fatalf("window end = %v, want %v", window.End, now)
+	}
+	if !window.Contains(start) || window.Contains(start.Add(-time.Nanosecond)) {
+		t.Fatal("window must include its start instant and exclude one nanosecond earlier")
+	}
+	if !window.Contains(now) || window.Contains(now.Add(time.Nanosecond)) {
+		t.Fatal("window must include the read instant and exclude the future")
+	}
+	if monthOf(start) != months[len(months)-1] {
+		t.Fatalf("partial first month %q missing from %v", monthOf(start), months)
+	}
+
+	// 29 February clamps the start to 28 February of the previous year.
+	leap := time.Date(2028, 2, 29, 12, 0, 0, 0, retentionJakarta(t))
+	leapWindow := retentionWindow(leap)
+	if got := leapWindow.Start.In(retentionJakarta(t)).Format("2006-01-02"); got != "2027-02-28" {
+		t.Fatalf("leap window start = %s", got)
+	}
+	leapMonths := service.backfillMonths(leap)
+	if len(leapMonths) != 13 || leapMonths[len(leapMonths)-1] != "2027-02" {
+		t.Fatalf("leap backfill months = %v", leapMonths)
+	}
+}
+
+// retentionWindow and retentionJakarta keep this package's tests on the same policy helper the
+// worker uses, without exporting test-only helpers from production code.
+func retentionWindow(now time.Time) retention.Window { return retention.NewWindow(now) }
+
+func retentionJakarta(t *testing.T) *time.Location {
+	t.Helper()
+	location, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		t.Fatalf("Jakarta location: %v", err)
+	}
+	return location
+}
+
+// FR-16: parsed transaction time, not Gmail arrival time, decides the period. A notification that
+// arrives in the current month but describes a transaction on the first retained day must land in
+// the partially retained oldest month; one day earlier or a future event is recorded as an
+// auditable skip instead of being imported or failing the whole page.
+func TestParsedEventTimeDecidesRetentionPeriodMembership(t *testing.T) {
+	ctx := context.Background()
+	f := newSyncFixtureMonths(t, 12)
+	f.connect(t, "100")
+	f.Provider.RawByID = map[string]RawMessage{
+		"partial-in": {ID: "partial-in", Raw: rawEmail("Pembayaran Berhasil!",
+			livinBodyFor("24 Nov 2025 09:30:45"))},
+		"one-day-out": {ID: "one-day-out", Raw: rawEmail("Pembayaran Berhasil!",
+			livinBodyFor("23 Nov 2025 09:30:45"))},
+		"future": {ID: "future", Raw: rawEmail("Pembayaran Berhasil!",
+			livinBodyFor("30 Nov 2026 09:00:00"))},
+		"current": {ID: "current", Raw: rawEmail("Pembayaran Berhasil!",
+			livinBodyFor("10 Nov 2026 09:30:45"))},
+	}
+	f.Provider.Pages = []MessageList{{Messages: []MessageRef{
+		{ID: "partial-in"}, {ID: "one-day-out"}, {ID: "future"}, {ID: "current"},
+	}}}
+
+	if _, err := f.Service.RunOnce(ctx); err != nil {
+		t.Fatalf("first backfill run: %v", err)
+	}
+	if got := f.transactionCount(t); got != 2 {
+		t.Fatalf("transactions = %d, want 2 (partial first month + current month)", got)
+	}
+	// The scanning month's job aggregates the routed row too, so imported counts both retained
+	// rows while the out-of-window and future rows stay as auditable skips.
+	seen, imported, duplicates, skipped, state := f.jobCounts(t, "2026-11")
+	if state != "COMPLETE" || imported != 2 || duplicates != 0 || skipped != 2 {
+		t.Fatalf("current month job = %s seen=%d imported=%d dup=%d skipped=%d",
+			state, seen, imported, duplicates, skipped)
+	}
+	var partialState string
+	var partialImported int
+	if err := f.Store.DB.QueryRow(`SELECT state, imported_count FROM import_jobs
+		WHERE owner_id = ? AND month_id = '2025-11'`, f.Owner).
+		Scan(&partialState, &partialImported); err != nil {
+		t.Fatalf("partial oldest month import job: %v", err)
+	}
+	if partialState != "COMPLETE" || partialImported != 1 {
+		t.Fatalf("partial oldest month job = %s imported=%d", partialState, partialImported)
+	}
+
+	// A replay of the same page keeps one row per source identity and does not re-import.
+	if _, err := f.Store.DB.Exec(`UPDATE gmail_sync_jobs SET state = 'CREATED',
+		page_token_ciphertext = NULL, page_token_iv = NULL, page_token_tag = NULL,
+		page_token_key_version = NULL WHERE owner_id = ? AND month_id = '2026-11'`,
+		f.Owner); err != nil {
+		t.Fatal(err)
+	}
+	f.Provider.Pages = append(f.Provider.Pages, f.Provider.Pages[0])
+	if _, err := f.Service.RunOnce(ctx); err != nil {
+		t.Fatalf("replay run: %v", err)
+	}
+	if got := f.transactionCount(t); got != 2 {
+		t.Fatalf("replay created duplicates: %d transactions", got)
+	}
+	_, replayImported, replayDuplicates, _, replayState := f.jobCounts(t, "2026-11")
+	if replayState != "COMPLETE" || replayImported != 0 || replayDuplicates < 1 {
+		t.Fatalf("replayed current job = %s imported=%d dup=%d", replayState, replayImported,
+			replayDuplicates)
+	}
+
+	// The staged window really has the partial oldest month as its last unit of work.
+	pending, err := f.Service.BackfillPending(ctx, f.Owner, f.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for pending {
+		if _, err := f.Service.RunOnce(ctx); err != nil {
+			t.Fatalf("drain backfill: %v", err)
+		}
+		if pending, err = f.Service.BackfillPending(ctx, f.Owner, f.Now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var backfillJobs int
+	if err := f.Store.DB.QueryRow(`SELECT COUNT(*) FROM gmail_sync_jobs
+		WHERE owner_id = ? AND kind = 'BACKFILL'`, f.Owner).Scan(&backfillJobs); err != nil {
+		t.Fatal(err)
+	}
+	months := f.Service.backfillMonths(f.Now)
+	if backfillJobs != len(months) || len(months) != 13 {
+		t.Fatalf("backfill jobs = %d, window months = %v", backfillJobs, months)
 	}
 }
