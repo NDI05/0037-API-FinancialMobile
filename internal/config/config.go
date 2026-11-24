@@ -41,6 +41,7 @@ type Config struct {
 	KeyVersion         int
 	LLM                LLM
 	CategoryLLM        CategoryLLM
+	Gmail              Gmail
 	Limits             Limits
 	Warnings           []string
 }
@@ -87,6 +88,30 @@ type CategoryLLM struct {
 	InstallAttemptsDay int
 	PromptPer1K      float64
 	CompletionPer1K  float64
+}
+
+// Gmail is the Gmail API integration policy. It is disabled by default so a backend without
+// Google Cloud credentials still runs every other feature.
+type Gmail struct {
+	Enabled            bool
+	ClientID           string
+	ClientSecret       string
+	RedirectURI        string
+	TopicName          string
+	PushAudience       string
+	PushServiceAccount string
+	AppDeepLink        string
+	AuthURL            string
+	TokenURL           string
+	RevokeURL          string
+	JWKSURL            string
+	Scope              string
+	StateTTL           time.Duration
+	BackfillMonths     int
+	WatchRenewBefore   time.Duration
+	WorkerInterval     time.Duration
+	PageSize           int
+	MaxPagesPerRun     int
 }
 
 type Limits struct {
@@ -147,6 +172,27 @@ func Load(env map[string]string) (*Config, error) {
 			PromptPer1K:      floatValue(env, "CATEGORY_LLM_PRICE_PROMPT_PER_1K_USD", 0),
 			CompletionPer1K:  floatValue(env, "CATEGORY_LLM_PRICE_COMPLETION_PER_1K_USD", 0),
 		},
+		Gmail: Gmail{
+			Enabled:            boolValue(env, "GMAIL_ENABLED", false),
+			ClientID:           get(env, "GMAIL_CLIENT_ID", ""),
+			ClientSecret:       get(env, "GMAIL_CLIENT_SECRET", ""),
+			RedirectURI:        get(env, "GMAIL_REDIRECT_URI", ""),
+			TopicName:          get(env, "GMAIL_PUBSUB_TOPIC", ""),
+			PushAudience:       get(env, "GMAIL_PUSH_AUDIENCE", ""),
+			PushServiceAccount: get(env, "GMAIL_PUSH_SERVICE_ACCOUNT", ""),
+			AppDeepLink:        get(env, "GMAIL_APP_DEEP_LINK", "pam://gmail/connected"),
+			AuthURL:            get(env, "GMAIL_AUTH_URL", "https://accounts.google.com/o/oauth2/v2/auth"),
+			TokenURL:           get(env, "GMAIL_TOKEN_URL", "https://oauth2.googleapis.com/token"),
+			RevokeURL:          get(env, "GMAIL_REVOKE_URL", "https://oauth2.googleapis.com/revoke"),
+			JWKSURL:            get(env, "GMAIL_JWKS_URL", "https://www.googleapis.com/oauth2/v3/certs"),
+			Scope:              get(env, "GMAIL_SCOPE", "https://www.googleapis.com/auth/gmail.readonly"),
+			StateTTL:           time.Duration(intValue(env, "GMAIL_STATE_TTL_SECONDS", 600)) * time.Second,
+			BackfillMonths:     intValue(env, "GMAIL_BACKFILL_MONTHS", 12),
+			WatchRenewBefore:   time.Duration(intValue(env, "GMAIL_WATCH_RENEW_BEFORE_HOURS", 24)) * time.Hour,
+			WorkerInterval:     time.Duration(intValue(env, "GMAIL_WORKER_INTERVAL_SECONDS", 60)) * time.Second,
+			PageSize:           intValue(env, "GMAIL_PAGE_SIZE", 50),
+			MaxPagesPerRun:     intValue(env, "GMAIL_MAX_PAGES_PER_RUN", 5),
+		},
 		Limits: Limits{
 			AnalysesPerHour: intValue(env, "RATE_LIMIT_ANALYSES_PER_HOUR", 10),
 			AnalysesPerDay:  intValue(env, "RATE_LIMIT_ANALYSES_PER_DAY", 40),
@@ -188,6 +234,25 @@ func Load(env map[string]string) (*Config, error) {
 			cfg.CategoryLLM.Deployment == "" || cfg.CategoryLLM.APIKey == "" ||
 			cfg.CategoryLLM.PromptPer1K <= 0 || cfg.CategoryLLM.CompletionPer1K <= 0 {
 			return nil, fmt.Errorf("invalid category LLM configuration: enabled requires azure endpoint/key and verified prices")
+		}
+	}
+	if cfg.Gmail.Enabled {
+		problems := []string{}
+		if cfg.Gmail.ClientID == "" || cfg.Gmail.ClientSecret == "" {
+			problems = append(problems, "GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET are required when GMAIL_ENABLED=true")
+		}
+		if parsed, err := url.Parse(cfg.Gmail.RedirectURI); err != nil || parsed.Scheme != "https" ||
+			parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			problems = append(problems, "GMAIL_REDIRECT_URI must be an HTTPS URL without query or fragment")
+		}
+		if cfg.Gmail.TopicName == "" {
+			problems = append(problems, "GMAIL_PUBSUB_TOPIC is required when GMAIL_ENABLED=true")
+		}
+		if cfg.Gmail.PushAudience == "" || cfg.Gmail.PushServiceAccount == "" {
+			problems = append(problems, "GMAIL_PUSH_AUDIENCE and GMAIL_PUSH_SERVICE_ACCOUNT are required when GMAIL_ENABLED=true")
+		}
+		if len(problems) > 0 {
+			return nil, fmt.Errorf("invalid Gmail configuration: %s", strings.Join(problems, "; "))
 		}
 	}
 	if cfg.Env == "production" {

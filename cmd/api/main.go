@@ -18,6 +18,7 @@ import (
 	"github.com/pam/recap/backend-go/internal/auth"
 	"github.com/pam/recap/backend-go/internal/categoryllm"
 	"github.com/pam/recap/backend-go/internal/config"
+	"github.com/pam/recap/backend-go/internal/gmail"
 	"github.com/pam/recap/backend-go/internal/httpapi"
 	"github.com/pam/recap/backend-go/internal/llm"
 	"github.com/pam/recap/backend-go/internal/store"
@@ -72,6 +73,41 @@ func run() error {
 		api.CategoryClassifier = categoryllm.NewAzure(cfg.CategoryLLM.BaseURL, cfg.CategoryLLM.APIKey,
 			cfg.CategoryLLM.Deployment, cfg.CategoryLLM.Model, cfg.CategoryLLM.Timeout)
 	}
+	// Gmail API integration is opt-in: without Google Cloud credentials every other feature keeps
+	// working and the Gmail routes answer 503.
+	var gmailCoordinator *gmail.Coordinator
+	if cfg.Gmail.Enabled {
+		gmailProvider := gmail.NewGoogleProvider(nil)
+		exchanger := gmail.NewOAuth(gmail.OAuthConfig{
+			ClientID:     cfg.Gmail.ClientID,
+			ClientSecret: cfg.Gmail.ClientSecret,
+			RedirectURI:  cfg.Gmail.RedirectURI,
+			AuthURL:      cfg.Gmail.AuthURL,
+			TokenURL:     cfg.Gmail.TokenURL,
+			RevokeURL:    cfg.Gmail.RevokeURL,
+			Scopes:       []string{cfg.Gmail.Scope},
+		})
+		gmailService := gmail.NewService(storeLayer, gmailProvider, exchanger, gmail.Settings{
+			RedirectURI:      cfg.Gmail.RedirectURI,
+			AppDeepLink:      cfg.Gmail.AppDeepLink,
+			TopicName:        cfg.Gmail.TopicName,
+			Scope:            cfg.Gmail.Scope,
+			StateTTL:         cfg.Gmail.StateTTL,
+			BackfillMonths:   cfg.Gmail.BackfillMonths,
+			PageSize:         cfg.Gmail.PageSize,
+			MaxPagesPerRun:   cfg.Gmail.MaxPagesPerRun,
+			WatchRenewBefore: cfg.Gmail.WatchRenewBefore,
+		}, logger)
+		verifier := gmail.NewOIDCVerifier(gmail.OIDCConfig{
+			Audience:       cfg.Gmail.PushAudience,
+			ServiceAccount: cfg.Gmail.PushServiceAccount,
+			JWKSURL:        cfg.Gmail.JWKSURL,
+		})
+		api.SetGmail(gmailService, verifier)
+		gmailCoordinator = &gmail.Coordinator{Service: gmailService, Interval: cfg.Gmail.WorkerInterval,
+			Log: logger}
+		gmailCoordinator.Start()
+	}
 	// Durable recovery worker: reclaims jobs whose owning request/process died, applies the
 	// bounded transient-retry policy and sweeps orphaned reservations.
 	worker := httpapi.NewCategoryWorker(api)
@@ -107,6 +143,9 @@ func run() error {
 	// reclaimed by the next process after their lease expires (recovery path, not data loss).
 	if cfg.CategoryLLM.Enabled {
 		worker.Stop()
+	}
+	if gmailCoordinator != nil {
+		gmailCoordinator.Stop()
 	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

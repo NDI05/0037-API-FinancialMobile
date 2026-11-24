@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 )
 
 func productionEnv() map[string]string {
@@ -127,5 +128,53 @@ func TestCategoryLLMFailsClosedWithoutVerifiedPrices(t *testing.T) {
 	env["CATEGORY_LLM_PRICE_COMPLETION_PER_1K_USD"] = "0.002"
 	if _, err := Load(env); err != nil {
 		t.Fatalf("valid category LLM config rejected: %v", err)
+	}
+}
+
+func TestGmailConfigurationDefaultsAndValidation(t *testing.T) {
+	base := map[string]string{"APP_ENV": "test", "DATABASE_URL": "file:./data/gmail-test.db"}
+	cfg, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Gmail.Enabled {
+		t.Fatal("Gmail must be opt-in")
+	}
+	if cfg.Gmail.Scope != "https://www.googleapis.com/auth/gmail.readonly" ||
+		cfg.Gmail.StateTTL != 10*time.Minute || cfg.Gmail.BackfillMonths != 12 ||
+		cfg.Gmail.PageSize != 50 || cfg.Gmail.MaxPagesPerRun != 5 ||
+		cfg.Gmail.AppDeepLink != "pam://gmail/connected" {
+		t.Fatalf("unexpected Gmail defaults: %+v", cfg.Gmail)
+	}
+
+	enabled := map[string]string{}
+	for key, value := range base {
+		enabled[key] = value
+	}
+	enabled["GMAIL_ENABLED"] = "true"
+	if _, err := Load(enabled); err == nil {
+		t.Fatal("enabled Gmail without credentials must fail closed")
+	}
+
+	enabled["GMAIL_CLIENT_ID"] = "client-id.apps.googleusercontent.com"
+	enabled["GMAIL_CLIENT_SECRET"] = "client-secret"
+	enabled["GMAIL_REDIRECT_URI"] = "https://api.example.test/v1/gmail/connect/callback"
+	enabled["GMAIL_PUBSUB_TOPIC"] = "projects/pam-uat/topics/gmail-push"
+	enabled["GMAIL_PUSH_AUDIENCE"] = "https://api.example.test/v1/internal/gmail/push"
+	enabled["GMAIL_PUSH_SERVICE_ACCOUNT"] = "pubsub-push@pam-uat.iam.gserviceaccount.com"
+	enabled["GMAIL_BACKFILL_MONTHS"] = "12"
+	enabled["GMAIL_WORKER_INTERVAL_SECONDS"] = "45"
+	cfg, err = Load(enabled)
+	if err != nil {
+		t.Fatalf("valid Gmail configuration rejected: %v", err)
+	}
+	if !cfg.Gmail.Enabled || cfg.Gmail.WorkerInterval != 45*time.Second ||
+		cfg.Gmail.PushServiceAccount != "pubsub-push@pam-uat.iam.gserviceaccount.com" {
+		t.Fatalf("Gmail configuration not mapped: %+v", cfg.Gmail)
+	}
+
+	enabled["GMAIL_REDIRECT_URI"] = "http://api.example.test/v1/gmail/connect/callback"
+	if _, err := Load(enabled); err == nil {
+		t.Fatal("a plain-HTTP redirect URI must be rejected")
 	}
 }

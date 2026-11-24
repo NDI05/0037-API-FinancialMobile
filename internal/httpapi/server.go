@@ -16,6 +16,7 @@ import (
 	"github.com/pam/recap/backend-go/internal/auth"
 	"github.com/pam/recap/backend-go/internal/categoryllm"
 	"github.com/pam/recap/backend-go/internal/config"
+	"github.com/pam/recap/backend-go/internal/gmail"
 	"github.com/pam/recap/backend-go/internal/llm"
 	"github.com/pam/recap/backend-go/internal/store"
 )
@@ -38,6 +39,9 @@ type Server struct {
 	Now                func() time.Time
 	Provider           llm.Provider
 	CategoryClassifier categoryllm.Classifier
+	// Gmail is nil unless the Gmail API integration is configured; handlers then answer 503.
+	Gmail             *gmail.Service
+	GmailPushVerifier gmail.PushVerifier
 	// providerSlots caps concurrent provider calls (inline requests and the recovery worker
 	// together) at 2: provider concurrency must never exceed the configured maximum.
 	providerSlots chan struct{}
@@ -50,6 +54,13 @@ func New(s *store.Store, cfg *config.Config, issuer *auth.Issuer, logger *slog.L
 	provider llm.Provider) *Server {
 	return &Server{Store: s, Config: cfg, Issuer: issuer, Log: logger, Now: time.Now, Provider: provider,
 		providerSlots: make(chan struct{}, MaxCategoryProviderConcurrency)}
+}
+
+// SetGmail enables the Gmail API endpoints. It is called once during startup; a nil service keeps
+// the feature disabled without changing the rest of the route table.
+func (s *Server) SetGmail(service *gmail.Service, verifier gmail.PushVerifier) {
+	s.Gmail = service
+	s.GmailPushVerifier = verifier
 }
 
 // Handler builds the route table and middleware chain.
@@ -107,6 +118,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/deletion-requests", s.authed(s.createDeletion))
 	mux.Handle("GET /v1/deletion-requests/{id}", s.authed(s.getDeletion))
 	mux.HandleFunc("GET /v1/deletion-receipts/{token}", s.getDeletionReceipt)
+	mux.Handle("POST /v1/gmail/connect/start", s.authed(s.gmailConnectStart))
+	mux.HandleFunc("GET /v1/gmail/connect/callback", s.gmailConnectCallback)
+	mux.Handle("GET /v1/gmail/status", s.authed(s.gmailStatus))
+	mux.Handle("POST /v1/gmail/disconnect", s.authed(s.gmailDisconnect))
+	mux.HandleFunc("POST /v1/internal/gmail/push", s.gmailPush)
 	mux.HandleFunc("POST /v1/internal/sweep", s.internalSweep)
 	return s.middleware(mux)
 }
@@ -144,7 +160,10 @@ func sanitizedRoute(path string) string {
 		return path
 	case path == "/v1/deletion-receipts" || strings.HasPrefix(path, "/v1/deletion-receipts/"):
 		return "/v1/deletion-receipts/{token}"
-	case path == "/v1/internal/sweep":
+	case path == "/v1/internal/sweep" || path == "/v1/internal/gmail/push":
+		return path
+	case path == "/v1/gmail/connect/start" || path == "/v1/gmail/connect/callback" ||
+		path == "/v1/gmail/status" || path == "/v1/gmail/disconnect":
 		return path
 	case strings.HasPrefix(path, "/v1/transactions/"):
 		return "/v1/transactions/{id}"
