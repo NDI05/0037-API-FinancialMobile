@@ -57,9 +57,13 @@ func (s *Store) sourceRefHash(sourceRef string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// validSourceRef accepts the device's opaque reference `UIDVALIDITY:UID` (both positive integers).
-// The raw Gmail message id is never part of it.
+// validSourceRef accepts the device's opaque reference `UIDVALIDITY:UID` (both positive integers)
+// and the server-side Gmail reference `g:<mailbox hash prefix>:<message id>` built by the Gmail
+// API coordinator. The raw message id only ever exists sealed at rest.
 func validSourceRef(raw string) bool {
+	if strings.HasPrefix(raw, "g:") {
+		return validGmailSourceRef(raw)
+	}
 	parts := strings.Split(raw, ":")
 	if len(parts) != 2 || len(raw) > 64 {
 		return false
@@ -72,6 +76,35 @@ func validSourceRef(raw string) bool {
 			if r < '0' || r > '9' {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+// validGmailSourceRef accepts `g:<16 hex mailbox prefix>:<Gmail message id>` where the message id
+// is the API's URL-safe base64-ish token (letters, digits, '-', '_'). Length is bounded so a
+// hostile client cannot push an oversized identity into the sealed column.
+func validGmailSourceRef(raw string) bool {
+	parts := strings.Split(raw, ":")
+	if len(parts) != 3 || len(raw) > 200 {
+		return false
+	}
+	prefix, messageID := parts[1], parts[2]
+	if len(prefix) != 16 {
+		return false
+	}
+	if _, err := hex.DecodeString(prefix); err != nil {
+		return false
+	}
+	if len(messageID) == 0 || len(messageID) > 64 {
+		return false
+	}
+	for _, r := range messageID {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
+			r == '-', r == '_':
+		default:
+			return false
 		}
 	}
 	return true

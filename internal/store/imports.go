@@ -122,7 +122,7 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 			return ImportBatchCounts{}, false, fmt.Errorf("invalid candidate eventAt: outside the import month %s", jobMonth)
 		}
 		if candidate.SourceRef != "" && !validSourceRef(candidate.SourceRef) {
-			return ImportBatchCounts{}, false, fmt.Errorf("sourceRef must look like UIDVALIDITY:UID")
+			return ImportBatchCounts{}, false, fmt.Errorf("sourceRef has an unsupported form")
 		}
 		if candidate.CategoryID != "" {
 			if err := s.ensureCategory(ctx, ownerID, candidate.CategoryID); err != nil {
