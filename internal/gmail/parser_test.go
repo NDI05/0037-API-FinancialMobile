@@ -469,6 +469,10 @@ func TestParseLivinStackedLabelRejectsPANAndFieldLines(t *testing.T) {
 		"Nomor Kartu 936009110000123456",
 		"ID Transaksi 202611100001234567",
 		"150.000,00",
+		"Ref ABC123",
+		"No Referensi ABC123",
+		"ID 12345",
+		"Kartu 1234",
 	} {
 		t.Run(nextLine, func(t *testing.T) {
 			body := `Pembayaran Berhasil
@@ -543,5 +547,28 @@ pkl 09:30:45 WIB
 	want := time.Date(2026, 11, 24, 9, 30, 45, 0, jakarta)
 	if !parsed.EventAt.Equal(want) {
 		t.Fatalf("eventAt = %s, want %s", parsed.EventAt, want)
+	}
+}
+
+// Prose with a colon ("Catatan: simpan struk") is not a field line and must not bridge a time
+// that sits two lines after the date.
+func TestParseLivinProseColonDoesNotBridgeTime(t *testing.T) {
+	body := `Pembayaran Berhasil
+
+Penerima
+WARUNG SEDERHANA
+
+Nominal Transaksi Rp 25.000,00
+Tanggal 24 Nov 2026
+Catatan: simpan struk ini
+pkl 09:30:45 WIB
+`
+	parsed := ParseLivinNotification(DecodedMessage{Subject: "Pembayaran Berhasil!", Text: body})
+	if parsed.Status != "PARSED" {
+		t.Fatalf("template must still parse: %+v", parsed)
+	}
+	want := time.Date(2026, 11, 24, 0, 0, 0, 0, jakarta)
+	if !parsed.EventAt.Equal(want) {
+		t.Fatalf("eventAt = %s, want date-only %s (prose must not bridge)", parsed.EventAt, want)
 	}
 }

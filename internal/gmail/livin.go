@@ -74,6 +74,10 @@ var (
 	fieldLabelPattern = regexp.MustCompile(`(?i)^[a-z][a-z .]{0,28}:`)
 	// longIdentifierPattern catches PAN/reference numbers printed as one token ("936009110000123456").
 	longIdentifierPattern = regexp.MustCompile(`\d{6,}`)
+	// looseFieldPattern catches colon-less reference lines ("Ref ABC123", "ID 12345"): a field word
+	// followed by a token that contains a digit.
+	looseFieldPattern = regexp.MustCompile(`(?i)^(?:ref|reference|no\.?\s*(?:ref(?:erensi)?|kartu|hp)` +
+		`|id|kartu|nomor)\b[\s:#.-]*[a-z0-9-]*\d[a-z0-9-]*$`)
 	// bareTimePattern catches a time-only next line ("pkl 09:30:45", "09:30") before the date pair
 	// logic gets a chance to join it with the date.
 	bareTimePattern = regexp.MustCompile(`(?i)^(?:pkl|pukul|waktu|jam)?\.?\s*\d{1,2}[:.]\d{2}`)
@@ -280,6 +284,10 @@ func looksLikeFieldValue(value string) bool {
 	if longIdentifierPattern.MatchString(value) {
 		return true
 	}
+	// Colon-less field lines ("Ref ABC123", "ID 12345", "Kartu 1234").
+	if looseFieldPattern.MatchString(lower) {
+		return true
+	}
 	if amountPattern.MatchString(value) || standaloneAmountPattern.MatchString(value) {
 		return true
 	}
@@ -312,6 +320,27 @@ func isSeparatorLine(value string) bool {
 		}
 	}
 	return true
+}
+
+// isBridgeFieldLine reports a line that may sit between the stacked date and time (amount,
+// reference, PAN, date/time, separator). Ordinary prose — even with a colon — must not bridge.
+func isBridgeFieldLine(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	if isSeparatorLine(value) {
+		return true
+	}
+	for _, prefix := range []string{"nominal", "tanggal", "tgl", "pukul", "pkl", "waktu", "jumlah",
+		"saldo", "no.", "no ", "ref", "referensi", "merchant pan", "customer pan", "kartu",
+		"id transaksi", "transaction", "amount", "total"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return amountPattern.MatchString(value) || standaloneAmountPattern.MatchString(value) ||
+		datePattern.MatchString(value) || bareTimePattern.MatchString(value)
 }
 
 func findAmount(lines []string) (int64, bool) {
@@ -440,8 +469,7 @@ func findEventAt(lines []string) (time.Time, bool) {
 				}
 				ok := true
 				for middle := index + step; middle != neighbour; middle += step {
-					line := strings.TrimSpace(lines[middle])
-					if !looksLikeFieldValue(line) && !isSeparatorLine(line) {
+					if !isBridgeFieldLine(lines[middle]) {
 						ok = false
 						break
 					}
