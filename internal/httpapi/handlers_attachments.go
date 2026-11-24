@@ -54,6 +54,17 @@ func (s *Server) createAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info, _ := authFrom(r)
+	if body.TransactionID != "" {
+		transaction, err := s.Store.GetTransaction(r.Context(), info.OwnerID, body.TransactionID)
+		if err != nil {
+			s.mapWriteError(w, r, err)
+			return
+		}
+		// Attachments are derivative metadata: never attach files to an expired transaction.
+		if !s.retainNotExpired(w, r, transaction.EventAt) {
+			return
+		}
+	}
 	attachment, err := s.Store.CreateAttachment(r.Context(), info.OwnerID, store.AttachmentInput{
 		TransactionID: body.TransactionID, FileName: body.FileName, Mime: body.MimeType,
 		SizeBytes: body.SizeBytes, Sha256: body.Sha256, StorageRef: body.StorageRef,
@@ -69,8 +80,9 @@ func (s *Server) createAttachment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAttachments(w http.ResponseWriter, r *http.Request) {
 	info, _ := authFrom(r)
 	query := r.URL.Query()
+	transactionID := query.Get("transactionId")
 	limit, _ := strconv.Atoi(query.Get("limit"))
-	page, err := s.Store.ListAttachments(r.Context(), info.OwnerID, query.Get("transactionId"),
+	page, err := s.Store.ListAttachments(r.Context(), info.OwnerID, transactionID,
 		query.Get("mime"), query.Get("q"), limit, query.Get("cursor"))
 	if err != nil {
 		if errors.Is(err, store.ErrInvalidCursor) {
@@ -80,6 +92,18 @@ func (s *Server) listAttachments(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mapWriteError(w, r, err)
 		return
+	}
+	// Cursor/scope validation runs first so a foreign cursor keeps returning 400 invalid_cursor; the
+	// retention guard then applies the same one-year window to attachment listings of a transaction.
+	if transactionID != "" {
+		transaction, err := s.Store.GetTransaction(r.Context(), info.OwnerID, transactionID)
+		if err != nil {
+			s.mapWriteError(w, r, err)
+			return
+		}
+		if !s.retainNotExpired(w, r, transaction.EventAt) {
+			return
+		}
 	}
 	items := make([]map[string]any, 0, len(page.Items))
 	for _, attachment := range page.Items {

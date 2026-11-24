@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/crypto"
+	"github.com/pam/recap/backend-go/internal/retention"
 )
 
 type TransactionSensitive struct {
@@ -118,6 +119,12 @@ func (s *Store) CreateTransaction(ctx context.Context, ownerID string, input Tra
 	if input.EventAt.IsZero() {
 		return Transaction{}, fmt.Errorf("eventAt is required")
 	}
+	// Backfilling older than the one-year window is rejected here as well as at the HTTP boundary.
+	// Future-dated manual entries keep their existing behaviour; the window upper bound applies to
+	// period selection (list/summary/analysis/import), not to this legacy entry path.
+	if err := retention.NewWindow(now).ValidateNotExpired(input.EventAt); err != nil {
+		return Transaction{}, err
+	}
 	id := NewID("tx")
 	fingerprint := strings.ToLower(strings.TrimSpace(input.Fingerprint))
 	if fingerprint == "" {
@@ -201,6 +208,13 @@ func (s *Store) ListTransactions(ctx context.Context, ownerID, monthID, category
 	if err != nil {
 		return TransactionPage{}, err
 	}
+	// The boundary month is partially retained: clamp the query start to the rolling window so a
+	// list never returns rows the policy has already expired.
+	window := retention.NewWindow(s.clock())
+	if err := window.ValidateMonth(start, end); err != nil {
+		return TransactionPage{}, err
+	}
+	start = window.ClampMonthStart(start)
 	scope := cursorScope(ownerID, monthID, categoryID, direction, source, q)
 	args := []any{ownerID, start.UnixMilli(), end.UnixMilli()}
 	sqlText := `SELECT t.id, t.owner_id, COALESCE(t.category_id, ''), COALESCE(c.code, ''),

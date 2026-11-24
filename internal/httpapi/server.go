@@ -128,6 +128,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/gmail/disconnect", s.authed(s.gmailDisconnect))
 	mux.HandleFunc("POST /v1/internal/gmail/push", s.gmailPush)
 	mux.HandleFunc("POST /v1/internal/sweep", s.internalSweep)
+	// Retention surface (CR-005): the public GET lets clients clamp their period picker; the
+	// internal sweep is token-gated and report-only unless deletion is explicitly enabled.
+	mux.Handle("GET /v1/retention", s.authed(s.retentionInfo))
+	mux.HandleFunc("POST /v1/internal/retention-sweep", s.internalRetentionSweep)
 	return s.middleware(mux)
 }
 
@@ -168,6 +172,10 @@ func sanitizedRoute(path string) string {
 		return path
 	case path == "/v1/gmail/connect/start" || path == "/v1/gmail/connect/callback" ||
 		path == "/v1/gmail/status" || path == "/v1/gmail/disconnect":
+		return path
+	case path == "/v1/internal/retention-sweep":
+		return path
+	case path == "/v1/retention":
 		return path
 	case strings.HasPrefix(path, "/v1/transactions/"):
 		return "/v1/transactions/{id}"

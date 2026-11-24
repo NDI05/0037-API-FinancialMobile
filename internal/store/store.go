@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pam/recap/backend-go/internal/retention"
 )
 
 var (
@@ -41,10 +43,21 @@ type Store struct {
 	DB         *sql.DB
 	DataKey    []byte
 	KeyVersion int
+	// Now is the clock used by retention checks and by the scheduled cleanup. It is a field so the
+	// boundary tests can pin it; production leaves it at time.Now.
+	Now func() time.Time
 }
 
 func New(db *sql.DB, dataKey []byte, keyVersion int) *Store {
-	return &Store{DB: db, DataKey: dataKey, KeyVersion: keyVersion}
+	return &Store{DB: db, DataKey: dataKey, KeyVersion: keyVersion, Now: time.Now}
+}
+
+// clock returns the retention clock, falling back to the wall clock for a zero-value Store.
+func (s *Store) clock() time.Time {
+	if s.Now == nil {
+		return time.Now()
+	}
+	return s.Now()
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
@@ -139,17 +152,9 @@ func monthIDFor(t time.Time) string {
 	return fmt.Sprintf("%04d-%02d", jakarta.Year(), int(jakarta.Month()))
 }
 
-var jakartaLocation = mustLoadJakarta()
-
-func mustLoadJakarta() *time.Location {
-	loc, err := time.LoadLocation("Asia/Jakarta")
-	if err != nil {
-		// The platform can lack tzdata in a scratch container. UTC+7 has no DST, so the fixed zone
-		// is exact for this product rather than a guess.
-		return time.FixedZone("Asia/Jakarta", 7*60*60)
-	}
-	return loc
-}
+// jakartaLocation is the single Asia/Jakarta location shared with the retention policy, so month
+// IDs and retention boundaries can never disagree about the timezone.
+var jakartaLocation = retention.Jakarta()
 
 func validateAttributes(attributes map[string]any) error {
 	if len(attributes) > 10 {

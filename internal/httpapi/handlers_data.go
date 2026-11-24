@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/auth"
+	"github.com/pam/recap/backend-go/internal/retention"
 	"github.com/pam/recap/backend-go/internal/store"
 )
 
@@ -248,6 +249,10 @@ func (s *Server) createTransaction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "eventAt must be RFC3339", correlationOf(r))
 		return
 	}
+	// Backfill older than the rolling window is out of policy; the store enforces the same bound.
+	if !s.retainNotExpired(w, r, eventAt) {
+		return
+	}
 	if body.Currency == "" {
 		body.Currency = "IDR"
 	}
@@ -304,6 +309,9 @@ func hashTransactionRequest(body transactionCreate) string {
 func (s *Server) listTransactions(w http.ResponseWriter, r *http.Request) {
 	info, _ := authFrom(r)
 	query := r.URL.Query()
+	if !s.retainMonth(w, r, query.Get("month")) {
+		return
+	}
 	limit, _ := strconv.Atoi(query.Get("limit"))
 	page, err := s.Store.ListTransactions(r.Context(), info.OwnerID, query.Get("month"),
 		query.Get("categoryId"), query.Get("direction"), query.Get("source"), query.Get("q"),
@@ -329,6 +337,11 @@ func (s *Server) getTransaction(w http.ResponseWriter, r *http.Request) {
 		s.mapWriteError(w, r, err)
 		return
 	}
+	// Expired rows are only reachable by direct id until the next cleanup run; keep them out of
+	// the API surface in the meantime so the policy holds at every read.
+	if !s.retainNotExpired(w, r, transaction.EventAt) {
+		return
+	}
 	writeJSON(w, http.StatusOK, transactionJSON(transaction))
 }
 
@@ -341,6 +354,14 @@ func (s *Server) updateTransaction(w http.ResponseWriter, r *http.Request) {
 		body.Revision = revisionHeader(r)
 	}
 	info, _ := authFrom(r)
+	current, err := s.Store.GetTransaction(r.Context(), info.OwnerID, r.PathValue("id"))
+	if err != nil {
+		s.mapWriteError(w, r, err)
+		return
+	}
+	if !s.retainNotExpired(w, r, current.EventAt) {
+		return
+	}
 	transaction, err := s.Store.UpdateTransaction(r.Context(), info.OwnerID, r.PathValue("id"),
 		store.TransactionPatch{CategoryID: body.CategoryID, Description: body.Description,
 			MerchantLabel: body.MerchantLabel, ExpectedFingerprint: body.ExpectedFingerprint,
@@ -356,6 +377,14 @@ func (s *Server) updateTransaction(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteTransaction(w http.ResponseWriter, r *http.Request) {
 	info, _ := authFrom(r)
+	current, err := s.Store.GetTransaction(r.Context(), info.OwnerID, r.PathValue("id"))
+	if err != nil {
+		s.mapWriteError(w, r, err)
+		return
+	}
+	if !s.retainNotExpired(w, r, current.EventAt) {
+		return
+	}
 	// Optional compare-and-swap: ?revision=N or If-Match: "N". Without either the historical
 	// unconditional delete still works for older clients; a value of 0 is a real guard.
 	expected := -1
@@ -408,8 +437,7 @@ func (s *Server) putSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	monthID := r.PathValue("monthID")
-	if _, _, err := store.ParseMonth(monthID); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "monthId must be YYYY-MM", correlationOf(r))
+	if !s.retainMonth(w, r, monthID) {
 		return
 	}
 	if payloadMonth, _ := body.Payload["monthId"].(string); payloadMonth != "" && payloadMonth != monthID {
@@ -435,8 +463,7 @@ func (s *Server) putSummary(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getSummary(w http.ResponseWriter, r *http.Request) {
 	monthID := r.PathValue("monthID")
-	if _, _, err := store.ParseMonth(monthID); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "monthId must be YYYY-MM", correlationOf(r))
+	if !s.retainMonth(w, r, monthID) {
 		return
 	}
 	info, _ := authFrom(r)
@@ -622,6 +649,11 @@ func revisionHeader(r *http.Request) int {
 }
 
 func (s *Server) mapWriteError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, retention.ErrOutsideRetention) {
+		// Store-level policy rejection: safe 400, never a 500.
+		s.writeOutsideRetention(w, r)
+		return
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "Not found", correlationOf(r))

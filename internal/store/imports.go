@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/crypto"
+	"github.com/pam/recap/backend-go/internal/retention"
 )
 
 type ImportJob struct {
@@ -95,7 +96,13 @@ func (s *Store) crossSourceDuplicateTx(ctx context.Context, tx *sql.Tx, ownerID 
 }
 
 func (s *Store) CreateImportJob(ctx context.Context, ownerID, monthID, templateVersion string, now time.Time) (ImportJob, error) {
-	if _, _, err := ParseMonth(monthID); err != nil {
+	monthStart, monthEnd, err := ParseMonth(monthID)
+	if err != nil {
+		return ImportJob{}, err
+	}
+	// Import is the backfill path, so it is bounded on both sides of the rolling window: no
+	// importing a month older than the retention policy and no importing a future month.
+	if err := retention.NewWindow(now).ValidateMonth(monthStart, monthEnd); err != nil {
 		return ImportJob{}, err
 	}
 	if templateVersion == "" {
@@ -105,7 +112,7 @@ func (s *Store) CreateImportJob(ctx context.Context, ownerID, monthID, templateV
 		return ImportJob{}, err
 	}
 	id := NewID("job")
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO import_jobs
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO import_jobs
 		(id, owner_id, month_id, state, template_version, started_at)
 		VALUES (?, ?, ?, 'CREATED', ?, ?)`,
 		id, ownerID, monthID, templateVersion, nowString(now))
@@ -152,6 +159,14 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 	}
 	// Validate everything before opening a write transaction: an invalid candidate rejects the
 	// entire batch instead of leaving a half-imported page.
+	window := retention.NewWindow(now)
+	jobStart, jobEnd, err := ParseMonth(jobMonth)
+	if err != nil {
+		return ImportBatchCounts{}, nil, false, err
+	}
+	if err := window.ValidateMonth(jobStart, jobEnd); err != nil {
+		return ImportBatchCounts{}, nil, false, err
+	}
 	for _, candidate := range candidates {
 		if err := validateImportCandidate(candidate); err != nil {
 			return ImportBatchCounts{}, nil, false, err
@@ -161,6 +176,11 @@ func (s *Store) ImportBatch(ctx context.Context, ownerID, jobID, batchKey, reque
 		}
 		if candidate.Status == "PARSED" && monthIDFor(candidate.EventAt) != jobMonth {
 			return ImportBatchCounts{}, nil, false, fmt.Errorf("invalid candidate eventAt: outside the import month %s", jobMonth)
+		}
+		if candidate.Status == "PARSED" {
+			if err := window.ValidateEventAt(candidate.EventAt); err != nil {
+				return ImportBatchCounts{}, nil, false, err
+			}
 		}
 		if candidate.SourceRef != "" && !validSourceRef(candidate.SourceRef) {
 			return ImportBatchCounts{}, nil, false, fmt.Errorf("sourceRef has an unsupported form")

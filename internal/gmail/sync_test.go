@@ -448,11 +448,11 @@ func TestLateEmailImportsIntoTransactionMonth(t *testing.T) {
 	f := newSyncFixtureMonths(t, 12)
 	connection := f.connect(t, "100")
 	f.Provider.RawByID = map[string]RawMessage{
-		"late-nov": {ID: "late-nov", Raw: rawEmail("Pembayaran Berhasil!", livinBodyFor("30 Nov 2026 20:15:00"))},
+		"late-nov": {ID: "late-nov", Raw: rawEmail("Pembayaran Berhasil!", livinBodyFor("31 Dec 2025 20:15:00"))},
 	}
 	f.Provider.Pages = []MessageList{{Messages: []MessageRef{{ID: "late-nov"}}}}
-	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-12", "", "late", func(pageProgress) error { return nil }); err != nil {
-		t.Fatalf("december scan: %v", err)
+	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-01", "", "late", func(pageProgress) error { return nil }); err != nil {
+		t.Fatalf("january scan: %v", err)
 	}
 	var monthID string
 	var seen, skipped int
@@ -460,8 +460,8 @@ func TestLateEmailImportsIntoTransactionMonth(t *testing.T) {
 		f.Owner).Scan(&monthID); err != nil {
 		t.Fatal(err)
 	}
-	if monthID != "2026-11" {
-		t.Fatalf("late email transaction month = %s, want 2026-11", monthID)
+	if monthID != "2025-12" {
+		t.Fatalf("late email transaction month = %s, want 2025-12", monthID)
 	}
 	if err := f.Store.DB.QueryRow(`SELECT COUNT(*) FROM import_skipped WHERE owner_id = ?`,
 		f.Owner).Scan(&skipped); err != nil {
@@ -470,7 +470,7 @@ func TestLateEmailImportsIntoTransactionMonth(t *testing.T) {
 	if skipped != 0 {
 		t.Fatalf("in-window late email was skipped: %d", skipped)
 	}
-	if err := f.Store.DB.QueryRow(`SELECT COUNT(*) FROM import_jobs WHERE owner_id = ? AND month_id = '2026-11'`,
+	if err := f.Store.DB.QueryRow(`SELECT COUNT(*) FROM import_jobs WHERE owner_id = ? AND month_id = '2025-12'`,
 		f.Owner).Scan(&seen); err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestLateEmailImportsIntoTransactionMonth(t *testing.T) {
 	}
 	// A replay of the same arrival scan must not duplicate the row.
 	f.Provider.Pages = []MessageList{{Messages: []MessageRef{{ID: "late-nov"}}}}
-	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-12", "", "late2", func(pageProgress) error { return nil }); err != nil {
+	if _, err := f.Service.importMonthPages(ctx, connection, "access-1", "2026-01", "", "late2", func(pageProgress) error { return nil }); err != nil {
 		t.Fatalf("replay scan: %v", err)
 	}
 	if got := f.transactionCount(t); got != 1 {
