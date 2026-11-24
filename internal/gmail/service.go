@@ -55,15 +55,15 @@ type Settings struct {
 	DevFake bool
 	// DevScenario selects the fake provider scenario: normal, history_expired or rate_limit.
 	DevScenario string
-	// TransientRetryBackoff throttles automatic retries after a provider outage so a broken
-	// upstream is not hammered every worker tick. A needs_reauth connection is never retried
-	// automatically; the user has to reconnect.
-	TransientRetryBackoff time.Duration
-	QueryFilter           string
+	QueryFilter string
 }
 
 // ErrSyncCooldown reports a manual sync request that arrived inside the configured cooldown.
 var ErrSyncCooldown = errors.New("gmail sync cooldown active")
+
+// ErrNeedsReauth reports a manual sync on a connection whose grant was revoked. A job queued in
+// that state would never drain, so the request is rejected until the owner reconnects.
+var ErrNeedsReauth = errors.New("gmail connection needs reauthorization")
 
 // SyncCooldownError carries the remaining cooldown for the HTTP 429 response.
 type SyncCooldownError struct {
@@ -100,9 +100,6 @@ func (s Settings) withDefaults() Settings {
 	}
 	if s.AppDeepLink == "" {
 		s.AppDeepLink = "pam://gmail/connected"
-	}
-	if s.TransientRetryBackoff <= 0 || s.TransientRetryBackoff > time.Hour {
-		s.TransientRetryBackoff = 10 * time.Minute
 	}
 	if s.Mode != "push" {
 		s.Mode = "polling"
@@ -439,6 +436,9 @@ func (s *Service) RequestSync(ctx context.Context, ownerID string) (SyncRequest,
 	if connection.State != "ACTIVE" {
 		return SyncRequest{}, ErrNotConnected
 	}
+	if connection.LastErrorCode == "needs_reauth" {
+		return SyncRequest{}, ErrNeedsReauth
+	}
 	requestedAt, queued, err := s.Store.RequestGmailSync(ctx, ownerID, s.Settings.SyncCooldown, now)
 	if err != nil {
 		return SyncRequest{}, err
@@ -662,7 +662,11 @@ func (s *Service) RunOnce(ctx context.Context) (SyncReport, error) {
 		token, tokenErr := s.accessToken(ctx, connection)
 		if tokenErr != nil {
 			report.Failures++
-			s.recordFailure(ctx, connection, tokenErr)
+			phase := "delta"
+			if !deltaDue && backfillDue {
+				phase = "backfill"
+			}
+			s.recordFailure(ctx, connection, tokenErr, phase)
 			s.finishEvents(ctx, events, "needs_reauth")
 			continue
 		}
@@ -671,7 +675,8 @@ func (s *Service) RunOnce(ctx context.Context) (SyncReport, error) {
 				s.Settings.TopicName)
 			if watchErr != nil {
 				report.Failures++
-				s.recordFailure(ctx, connection, watchErr)
+				// Watch bookkeeping is push-only; keep the sync phase unchanged on failure.
+				s.recordFailure(ctx, connection, watchErr, "delta")
 				continue
 			}
 			historyID := state.HistoryID
@@ -696,7 +701,7 @@ func (s *Service) RunOnce(ctx context.Context) (SyncReport, error) {
 		if deltaDue {
 			if err := s.runDelta(ownerCtx, connection, token); err != nil {
 				report.Failures++
-				s.recordFailure(ctx, connection, err)
+				s.recordFailure(ctx, connection, err, "delta")
 				continue
 			}
 			report.Deltas++
@@ -712,7 +717,7 @@ func (s *Service) RunOnce(ctx context.Context) (SyncReport, error) {
 		if backfillDue {
 			if err := s.runBackfill(ownerCtx, connection, token); err != nil {
 				report.Failures++
-				s.recordFailure(ctx, connection, err)
+				s.recordFailure(ctx, connection, err, "backfill")
 				continue
 			}
 			report.Backfills++
@@ -801,13 +806,15 @@ func (s *Service) accessToken(ctx context.Context, connection store.GmailConnect
 	return tokens.AccessToken, nil
 }
 
-func (s *Service) recordFailure(ctx context.Context, connection store.GmailConnection, err error) {
+func (s *Service) recordFailure(ctx context.Context, connection store.GmailConnection, err error,
+	phase string) {
 	code := classifyError(err)
 	// needs_reauth is a terminal state until the owner reconnects; it keeps the schema's existing
 	// "error" sync_state and is carried in last_error_code. A retryable failure (rate limit, 5xx)
-	// leaves the sync state at "delta": the queued job stays open and the next tick retries it.
-	syncState := "delta"
-	if code == "needs_reauth" {
+	// keeps the phase that failed ("delta" or "backfill") because its job stays open and the next
+	// tick retries it.
+	syncState := phase
+	if code == "needs_reauth" || syncState == "" {
 		syncState = "error"
 	}
 	if updateErr := s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, syncState, "",

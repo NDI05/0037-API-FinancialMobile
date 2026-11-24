@@ -58,7 +58,9 @@ type gmailSyncAcceptedResponse struct {
 type gmailSyncCooldownResponse struct {
 	Code              string `json:"code"`
 	Message           string `json:"message"`
-	RetryAfterSeconds int    `json:"retry_after_seconds"`
+	Retryable         bool   `json:"retryable"`
+	RetryAfterSeconds int    `json:"retryAfterSeconds"`
+	CorrelationID     string `json:"correlationId"`
 }
 
 type gmailDisconnectResponse struct {
@@ -241,6 +243,10 @@ func (s *Server) gmailSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "gmail_not_connected", "No active Gmail connection",
 			correlationOf(r))
 		return
+	case errors.Is(err, gmail.ErrNeedsReauth):
+		writeError(w, http.StatusConflict, "gmail_needs_reauth",
+			"Gmail authorization must be renewed before syncing", correlationOf(r))
+		return
 	case errors.Is(err, gmail.ErrSyncCooldown):
 		cooldown := &gmail.SyncCooldownError{}
 		_ = errors.As(err, &cooldown)
@@ -252,7 +258,7 @@ func (s *Server) gmailSync(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		_ = json.NewEncoder(w).Encode(gmailSyncCooldownResponse{
 			Code: "sync_cooldown", Message: "A Gmail sync was requested recently",
-			RetryAfterSeconds: seconds,
+			Retryable: true, RetryAfterSeconds: seconds, CorrelationID: correlationOf(r),
 		})
 		return
 	case err != nil:

@@ -177,6 +177,62 @@ func TestManualSyncCooldownThenCoalesces(t *testing.T) {
 	if !coalesced.Coalesced {
 		t.Fatalf("open delta job must coalesce: %#v", coalesced)
 	}
+	if status, err := f.Service.Status(ctx, f.Owner); err != nil || status.SyncRequestedAt.IsZero() {
+		t.Fatalf("accepted sync must be visible as pending: %#v err=%v", status, err)
+	}
+	// Draining the queued delta must retire the manual-sync marker; otherwise status stays
+	// "connecting" forever (auditor MAJOR-1).
+	if _, err := f.Service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err := f.Service.Status(ctx, f.Owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.SyncRequestedAt.IsZero() {
+		t.Fatalf("sync_requested_at not cleared after drain: %#v", status.SyncRequestedAt)
+	}
+	if status.SyncState != "idle" || status.NeedsReauth {
+		t.Fatalf("post-drain status = %#v", status)
+	}
+}
+
+func TestManualSyncRejectedWhenNeedsReauth(t *testing.T) {
+	ctx := context.Background()
+	f := newPollingFixture(t, 1)
+	f.connect(t, "100")
+	if err := f.Store.UpdateGmailSyncState(ctx, f.Owner, "error", "", "needs_reauth",
+		f.Now, f.Now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Service.RequestSync(ctx, f.Owner); !errors.Is(err, ErrNeedsReauth) {
+		t.Fatalf("needs_reauth sync error = %v", err)
+	}
+	if status, err := f.Service.Status(ctx, f.Owner); err != nil || !status.NeedsReauth ||
+		!status.SyncRequestedAt.IsZero() {
+		t.Fatalf("rejected sync must not queue a marker: %#v err=%v", status, err)
+	}
+}
+
+func TestBackfillFailureKeepsBackfillPhase(t *testing.T) {
+	ctx := context.Background()
+	f := newPollingFixture(t, 1)
+	f.connect(t, "100")
+	// A fresh delta attempt keeps deltaDue false so the retryable failure comes from backfill.
+	if err := f.Store.RecordGmailAttempt(ctx, f.Owner, f.Now); err != nil {
+		t.Fatal(err)
+	}
+	f.Provider.ListErr = &APIError{Status: 429, Code: "rate_limited"}
+	if _, err := f.Service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err := f.Service.Status(ctx, f.Owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.SyncState != "backfill" || status.LastErrorCode == "" || status.NeedsReauth {
+		t.Fatalf("backfill failure status = %#v", status)
+	}
 }
 
 func TestManualSyncSurvivesRestartWithoutDuplicates(t *testing.T) {

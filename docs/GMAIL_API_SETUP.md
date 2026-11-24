@@ -153,9 +153,13 @@ panggilan (`watchCalls`/`stopCalls` harus 0 di polling), tanpa id/email/token.
    eksplisit `outside_retention`. Checkpoint halaman disimpan setelah batch impor diakui; percobaan
    ulang tidak menggandakan transaksi (dedupe per owner + source ref).
 5. **Manual sync** (`POST /v1/gmail/sync`, sesi owner): `202` `queued`/`coalesced` bila diterima,
-   `429 sync_cooldown` (+`retry_after_seconds`) bila masih cooldown, `409 gmail_not_connected`,
-   `503 gmail_disabled`. Permintaan disimpan durable (bertahan restart) dan hanya menjalankan
-   DELTA; satu owner hanya punya satu job DELTA terbuka. Backfill tetap mengikuti jadwal bergilir.
+   `429 {"code":"sync_cooldown","retryable":true,"retryAfterSeconds":24}` bila masih cooldown,
+   `409 gmail_not_connected`, `409 gmail_needs_reauth` (grant dicabut; Android tampilkan CTA
+   reconnect dan jangan menunggu), `503 gmail_disabled`. Permintaan disimpan durable (bertahan
+   restart) dan hanya menjalankan DELTA; satu owner hanya punya satu job DELTA terbuka. Server
+   menandai `sync_requested_at` saat menerima permintaan dan **menghapusnya** saat job DELTA
+   yang dipicu selesai (termasuk hasil kosong/no-op), jadi status tidak tertahan di "pending".
+   Backfill tetap mengikuti jadwal bergilir.
 6. **Pemulihan cursor kedaluwarsa** (`history.list` 404): server mengambil profile `historyId`
    **sebelum** scan (baseline), memindai ulang setiap bulan WIB dari sukses terakhir sampai
    sekarang (dibatasi retensi 12 bulan) dengan batas `after:<unix>` + `before:<unix>` per bulan,
@@ -188,8 +192,10 @@ panggilan (`watchCalls`/`stopCalls` harus 0 di polling), tanpa id/email/token.
   sedangkan **Merchant PAN, Customer PAN, No. Referensi tidak** pernah disimpan atau di-log.
 - Tidak ada alamat email penuh, ID Gmail mentah, token, atau isi email di log. `sanitizedRoute`
   memetakan callback/push/dev ke label tetap.
-- Filter metadata (pengirim/duplikat) sebelum `messages.get`; rate limit per owner dan per
-  project dengan pagination + retry.
+- Dedupe dilakukan saat impor lewat `source_ref` (`ImportBatch`), bukan lewat panggilan
+  metadata Gmail terpisah: setiap id pesan pada halaman delta/recovery diambil penuh (format
+  penuh) sekali lalu dedupe di store sebelum baris ditulis. Rate limit tetap per owner dan per
+  project dengan pagination + retry; polling kosong tidak memanggil provider.
 - Dedupe key: `source_ref = g:<16 hex hash email>:<gmail message id>`, konsisten setelah
   reconnect.
 

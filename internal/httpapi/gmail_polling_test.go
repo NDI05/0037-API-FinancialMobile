@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/url"
 	"os"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/gmail"
+	"github.com/pam/recap/backend-go/internal/store"
 )
 
 // newGmailPollingHarness attaches a polling-mode Gmail service. With devFake it also enables the
@@ -131,12 +133,26 @@ func TestGmailPollingSyncQueueStatusAndPushAbsence(t *testing.T) {
 	if status != 429 || cooldown["code"] != "sync_cooldown" {
 		t.Fatalf("second sync = %d %#v", status, cooldown)
 	}
-	if retry, _ := cooldown["retry_after_seconds"].(float64); retry <= 0 {
-		t.Fatalf("cooldown retry_after_seconds = %#v", cooldown["retry_after_seconds"])
+	if cooldown["retryable"] != true {
+		t.Fatalf("cooldown retryable = %#v", cooldown["retryable"])
+	}
+	if retry, _ := cooldown["retryAfterSeconds"].(float64); retry <= 0 {
+		t.Fatalf("cooldown retryAfterSeconds = %#v", cooldown["retryAfterSeconds"])
+	}
+	if _, ok := cooldown["retry_after_seconds"]; ok {
+		t.Fatalf("cooldown must use contract camelCase: %#v", cooldown)
 	}
 	if status, queuedStatus := h.request("GET", "/v1/gmail/status", token, nil); status != 200 ||
-		queuedStatus["sync_state"] != "delta" {
+		queuedStatus["sync_state"] != "delta" || queuedStatus["sync_requested_at"] == nil {
 		t.Fatalf("queued status = %d %#v", status, queuedStatus)
+	}
+	// The worker drains the durable job; the pending marker must disappear with it.
+	if _, err := h.service.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status, drained := h.request("GET", "/v1/gmail/status", token, nil); status != 200 ||
+		drained["sync_state"] != "idle" || drained["sync_requested_at"] != nil {
+		t.Fatalf("drained status = %d %#v", status, drained)
 	}
 
 	h.register("polling-other@example.test")
@@ -230,4 +246,32 @@ func TestGmailDevFakeConsentFlow(t *testing.T) {
 
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func TestGmailSyncRejectedWhenNeedsReauth(t *testing.T) {
+	h := newGmailPollingHarness(t, false)
+	h.register("reauth@example.test")
+	token, _ := h.login("reauth@example.test")
+	startStatus, start := h.request("POST", "/v1/gmail/connect/start", token, map[string]any{})
+	if startStatus != 200 {
+		t.Fatalf("start = %d %#v", startStatus, start)
+	}
+	parsed, err := url.Parse(start["authorization_url"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback, _ := h.rawRoundTrip("GET", "/v1/gmail/connect/callback?code=code-good&state="+
+		url.QueryEscape(parsed.Query().Get("state")), nil, nil)
+	if callback.StatusCode != 302 {
+		t.Fatalf("callback = %d", callback.StatusCode)
+	}
+	owner := store.OwnerIDForEmail("reauth@example.test")
+	if err := h.store.UpdateGmailSyncState(context.Background(), owner, "error", "",
+		"needs_reauth", time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	status, body := h.request("POST", "/v1/gmail/sync", token, nil)
+	if status != 409 || body["code"] != "gmail_needs_reauth" || body["retryable"] != false {
+		t.Fatalf("needs_reauth sync = %d %#v", status, body)
+	}
 }

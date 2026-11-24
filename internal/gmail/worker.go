@@ -124,6 +124,10 @@ func (s *Service) runDelta(ctx context.Context, connection store.GmailConnection
 	if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, "COMPLETE", "", s.Now()); err != nil {
 		return err
 	}
+	// The job that a manual sync queued is done, so the pending marker must not outlive it.
+	if err := s.Store.ClearGmailSyncRequest(ctx, connection.OwnerID, s.Now(), s.Now()); err != nil {
+		s.Log.Warn("gmail_sync_request_clear_failed")
+	}
 	return s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "idle", latest, "", s.Now(), s.Now())
 }
 
@@ -329,6 +333,9 @@ func (s *Service) replayDeltaAfterRecovery(ctx context.Context, connection store
 	if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, "COMPLETE", "", s.Now()); err != nil {
 		return err
 	}
+	if err := s.Store.ClearGmailSyncRequest(ctx, connection.OwnerID, s.Now(), s.Now()); err != nil {
+		s.Log.Warn("gmail_sync_request_clear_failed")
+	}
 	return s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "idle", latest, "", s.Now(), s.Now())
 }
 
@@ -339,18 +346,27 @@ func (s *Service) failJob(ctx context.Context, connection store.GmailConnection,
 	job store.GmailSyncJob, cause error) {
 	now := s.Now()
 	code := classifyError(cause)
+	phase := "delta"
+	if job.Kind == "BACKFILL" {
+		phase = "backfill"
+	}
 	if code == "needs_reauth" {
 		if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, "NEEDS_REAUTH", code,
 			now); err != nil {
 			s.Log.Warn("gmail_sync_finish_failed")
 		}
-		s.recordFailure(ctx, connection, cause)
+		// A terminal job can never drain a manual request; drop the marker so status does not
+		// stay "connecting" forever. The reconnect CTA is driven by needs_reauth instead.
+		if err := s.Store.ClearGmailSyncRequest(ctx, connection.OwnerID, now, now); err != nil {
+			s.Log.Warn("gmail_sync_request_clear_failed")
+		}
+		s.recordFailure(ctx, connection, cause, phase)
 		return
 	}
 	if err := s.Store.RequeueGmailSyncJob(ctx, connection.OwnerID, job.ID, code, now); err != nil {
 		s.Log.Warn("gmail_sync_requeue_failed")
 	}
-	s.recordFailure(ctx, connection, cause)
+	s.recordFailure(ctx, connection, cause, phase)
 }
 
 // candidatePlacement pairs a parsed candidate with the WIB month of its transaction date. The

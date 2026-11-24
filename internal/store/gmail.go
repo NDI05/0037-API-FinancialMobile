@@ -481,6 +481,18 @@ func (s *Store) RequestGmailSync(ctx context.Context, ownerID string, cooldown t
 	return connection.SyncRequestedAt, false, nil
 }
 
+// ClearGmailSyncRequest retires a manual-sync request once the delta it triggered finishes. The
+// cutoff protects a request that arrived after this run started: only markers at or before the
+// completion timestamp are cleared, so a fresh request keeps its pending status.
+func (s *Store) ClearGmailSyncRequest(ctx context.Context, ownerID string, cutoff, now time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE gmail_connections
+		SET sync_requested_at = NULL, updated_at = ?
+		WHERE owner_id = ? AND state = 'ACTIVE'
+		  AND sync_requested_at IS NOT NULL AND sync_requested_at <= ?`,
+		nowString(now), ownerID, nowString(cutoff))
+	return err
+}
+
 // RequeueGmailSyncJob keeps a job open after a retryable provider failure (rate limit, 5xx) so
 // the next worker tick resumes the same checkpoint instead of losing the batch.
 func (s *Store) RequeueGmailSyncJob(ctx context.Context, ownerID, jobID, errorCode string,

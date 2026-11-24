@@ -55,8 +55,9 @@ Jika belum pernah terhubung: `{"connected": false, ...}` dengan field waktu `nul
 
 `POST /v1/gmail/disconnect`
 
-- Auth wajib. Memanggil `users.stop` watch, mencabut token bila mungkin, menghapus kredensial
-  tersimpan, menolak pekerjaan baru. Respons `200 {"disconnected": true}`.
+- Auth wajib. Di mode push memanggil `users.stop` watch; di mode polling tidak ada watch yang
+  dihentikan. Mencabut token bila mungkin, menghapus kredensial tersimpan, menolak pekerjaan
+  baru. Respons `200 {"disconnected": true}`.
 - Data transaksi yang sudah dikonfirmasi **tidak** dihapus oleh disconnect (retensi terpisah).
 
 ## 5. Pub/Sub push (internal, tidak dipakai Android)
@@ -110,8 +111,8 @@ klien lama; Android wajib memakai field/endpoint baru untuk UAT HP fisik.
 
 - `GMAIL_MODE=polling` (default produksi UAT): OAuth, backfill, dan delta berjalan **tanpa**
   Pub/Sub. Server tidak memanggil `users.watch`/`users.stop`, tidak menginisialisasi verifier
-  push, dan tidak mengekspos perilaku push. Endpoint `POST /v1/internal/gmail/push` tidak
-  terdaftar (404) pada mode ini.
+  push, dan tidak mengekspos perilaku push. Endpoint `POST /v1/internal/gmail/push` dijawab
+  `404 not_found` pada mode ini.
 - `GMAIL_MODE=push` (opt-in rollback): perilaku Pub/Sub lama dipertahankan. Konfigurasi
   `GMAIL_PUBSUB_TOPIC`, `GMAIL_PUSH_AUDIENCE`, `GMAIL_PUSH_SERVICE_ACCOUNT` wajib hanya pada
   mode ini; pada mode polling nilainya boleh kosong dan diabaikan.
@@ -164,7 +165,10 @@ klien lama; Android wajib memakai field/endpoint baru untuk UAT HP fisik.
   (tidak membuat job kedua).
 - Dalam cooldown (default 60 s): `429 {"code": "sync_cooldown", "retryable": true,
   "retryAfterSeconds": 24}`.
-- Gmail belum aktif: `503 gmail_disabled`; belum terhubung: `409 gmail_not_connected`.
+- Gmail belum aktif: `503 gmail_disabled`; belum terhubung: `409 gmail_not_connected`; grant
+  dicabut: `409 gmail_needs_reauth` (jangan mengantrekan job yang tidak akan pernah diproses).
+- `sync_requested_at` pada status hanya terisi selama job yang dipicu permintaan manual belum
+  selesai; server membersihkannya saat job DELTA selesai, termasuk bila hasilnya kosong.
 - Endpoint hanya mengantrekan; tidak menunggu job selesai dan tidak pernah memulai impor saat
   sheet dibuka.
 
