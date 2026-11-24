@@ -71,8 +71,9 @@ Isi env `GMAIL_*` lalu set `GMAIL_ENABLED=true`; langkah Google Cloud Console, d
 dan gate yang belum dijalankan ada di [`docs/GMAIL_API_SETUP.md`](docs/GMAIL_API_SETUP.md).
 Refresh token/email/payload push disimpan terenkripsi; raw MIME hanya diproses di memori dan
 PAN/No. Referensi tidak pernah disimpan atau di-log. Worker berjalan di dalam proses API dengan
-tick `GMAIL_WORKER_INTERVAL_SECONDS` dan memakai jalur yang sama dengan tombol "Sinkronkan
-sekarang". Tes memakai provider palsu: `./scripts/go.sh test ./internal/gmail -count=1`.
+tick `GMAIL_WORKER_INTERVAL_SECONDS`. Tidak ada endpoint "sinkronkan sekarang": sinkronisasi
+dipicu oleh push Pub/Sub, tick worker, dan callback koneksi; reconnect di aplikasi cukup memanggil
+`/v1/gmail/connect/start`. Tes memakai provider palsu: `./scripts/go.sh test ./internal/gmail -count=1`.
 
 ## Secret dan data
 

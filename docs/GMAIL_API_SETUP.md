@@ -82,7 +82,10 @@ Validasi production menolak konfigurasi Gmail yang tidak lengkap dan redirect UR
 ## 4. Alur runtime
 
 1. **Start** (`POST /v1/gmail/connect/start`) membuat `state` sekali pakai + PKCE S256, terikat
-   owner, TTL ≤10 menit. `reconnect: true` mengganti koneksi lama (watch lama di-stop dulu).
+   owner, TTL ≤10 menit. `reconnect: true` mengganti koneksi lama: bila mailbox-nya berbeda,
+   server mem-stop watch dan me-revoke token koneksi lama **sebelum** menyimpan yang baru, lalu
+   mengosongkan `gmail_sync_jobs`/event push lama sehingga mailbox baru benar-benar
+   di-backfill 12 bulan dari awal.
 2. **Callback** (`GET /v1/gmail/connect/callback`) memvalidasi state, menukar `code`,
    memverifikasi email akun, menyimpan refresh token terenkripsi (AES-256-GCM via
    `internal/crypto`), menjalankan `users.watch`, lalu redirect ke deep link
@@ -94,10 +97,16 @@ Validasi production menolak konfigurasi Gmail yang tidak lengkap dan redirect UR
    (`event_key` unik) lalu diproses worker.
 4. **Worker**: memperbarui watch yang mau kedaluwarsa, lalu memproses delta (cursor
    `history.list`) atau backfill bulan bergulir paling baru yang belum selesai — maksimum
-   `GMAIL_MAX_PAGES_PER_RUN` halaman per tick. Checkpoint halaman disimpan setelah batch impor
-   diakui; percobaan ulang tidak menggandakan transaksi (dedupe per owner + source ref).
+   `GMAIL_MAX_PAGES_PER_RUN` halaman per tick. Bulan akuntansi ditentukan oleh **tanggal
+   transaksi hasil parser**, bukan tanggal email: email 1 Desember untuk transaksi 30 November
+   tetap masuk ke bulan November (job impor bulan itu), sedangkan transaksi di luar jendela
+   retensi ditolak dengan alasan eksplisit `outside_retention`. Checkpoint halaman disimpan
+   setelah batch impor diakui; percobaan ulang tidak menggandakan transaksi (dedupe per owner +
+   source ref).
 5. **Delta kedaluwarsa** (404/`history.list` invalid): scan ulang bulan berjalan (aman karena
-   dedupe), ambil cursor baru dari `users.getProfile`, lanjut.
+   dedupe) dengan checkpoint per halaman; bila kena batas halaman per tick, job tetap terbuka dan
+   cursor baru **hanya** disimpan setelah seluruh rescan durable diimpor. Satu owner hanya punya
+   satu job DELTA terbuka (unique index parsial), jadi push burst dan timer tidak saling menimpa.
 6. **Kategorisasi otomatis ikut jalan**: setelah satu batch impor diakui, worker hanya
    meng-enqueue transaksi yang benar-benar baru (dengan consent `AI_CATEGORIZATION` GRANTED)
    tanpa memanggil provider, lalu menjalankan satu jendela drain server-side yang dibatasi
@@ -106,6 +115,14 @@ Validasi production menolak konfigurasi Gmail yang tidak lengkap dan redirect UR
    penolakan budget tidak menghapus transaksi. Idempoten: replay batch tidak menambah job.
 7. **Disconnect** (`POST /v1/gmail/disconnect`): stop watch, revoke token bila mungkin, hapus
    kredensial tersimpan, tolak pekerjaan baru. Transaksi yang sudah dikonfirmasi tidak dihapus.
+8. **Backoff**: token dicabut/scope hilang (`needs_reauth`) menghentikan sinkronisasi otomatis
+   sampai owner reconnect; gangguan provider sementara di-retry setelah jeda
+   (`GMAIL_WORKER_INTERVAL_SECONDS` tetap berjalan, tapi koneksi yang sedang backoff dilewati).
+9. **Koeksistensi dengan IMAP/aplikasi lama**: setelah Gmail API aktif, jalur impor server
+   (dan app-password di perangkat) tidak boleh berjalan untuk mailbox yang sama. Gmail API
+   menjadi satu-satunya jalur server. Sebagai jaring aman, transaksi yang sudah masuk lewat
+   IMAP dikenali dari identitas naturalnya (arah + nominal + waktu transaksi) dan notifikasi
+   Gmail yang sama dihitung duplikat, bukan baris kedua.
 
 ## 5. Keamanan dan batas data
 

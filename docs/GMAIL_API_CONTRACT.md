@@ -77,7 +77,24 @@ event durable lalu ACK 2xx. Event ganda/terlambat harus idempoten.
 - Hasil klasifikasi yang terlambat tidak pernah menulis ke owner lain; kegagalan provider tidak
   menghapus transaksi. Status/field API tidak berubah — klien tetap memakai kontrak di atas.
 
-## 7. Catatan Android
+## 7. Perilaku sinkronisasi yang mengikat klien
+
+Tanpa menambah field API, perilaku berikut disepakati:
+
+- Bulan transaksi mengikuti **tanggal transaksi** hasil parser notifikasi, bukan tanggal email
+  diterima. Email yang datang terlambat (lintas bulan) tetap masuk ke bulan transaksinya;
+  transaksi di luar jendela retensi 12 bulan ditolak dengan alasan eksplisit, tidak dibuang diam-diam.
+- `reconnect: true` dengan mailbox berbeda me-revoke token lama dan mereset progres sinkron
+  mailbox lama; mailbox baru memulai backfill 12 bulan dari awal. Replay state OAuth lama tidak
+  mengaktifkan koneksi lama.
+- `sync_state` tetap memakai nilai yang telah ada (`idle`, `backfill`, `delta`, `error`);
+  `needs_reauth` dilaporkan lewat `last_error_code`, dan pada kondisi itu Android harus meminta
+  pengguna reconnect. Gangguan provider sementara di-retry dengan backoff server-side.
+- Setelah Gmail API aktif, impor IMAP/app-password untuk mailbox yang sama tidak boleh
+  dijalankan (Gmail API satu-satunya jalur server). Notifikasi Gmail yang transaksinya sudah
+  pernah diimpor lewat IMAP dikenali sebagai duplikat lintas sumber.
+
+## 8. Catatan Android
 
 - App hanya perlu: tombol "Tautkan Gmail" (panggil start, buka URL), deep link
   `pam://gmail/connected`, tampilan status, dan tombol "Putuskan".
