@@ -436,7 +436,7 @@ Rotasi kunci hanya dengan migrasi re-fingerprint; kunci dihapus saat akun dihapu
 | List page | 50 default / 100 max |
 | Search scan | 2.000 baris, rentang ≤31 hari |
 | Amount | ≤1.000.000.000.000.000 minor |
-| Lampiran | 10 MB, 10/transaksi |
+| Lampiran (pensiun, CR-008) | Tidak ada API aktif (404); batas 10 MB/10 per transaksi hanya catatan historis |
 | Analisis | rate + daily ceiling existing (FR-50) |
 
 Reservasi biaya provider memeriksa biaya terpakai + reservasi outstanding + biaya panggilan
