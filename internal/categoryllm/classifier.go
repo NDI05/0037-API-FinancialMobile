@@ -17,8 +17,8 @@ const (
 	// MappingVersion identifies how provider results are attributed to candidates. The durable
 	// cache is keyed by it so entries written while results were matched by array position are
 	// never trusted again; a new version is a cache miss, not an overwrite of real data.
-	MappingVersion = "caseid/1"
-	MaxCandidates   = 5
+	MappingVersion   = "caseid/1"
+	MaxCandidates    = 5
 	MaxMerchantRunes = 120
 	// MaxInputTokens is the model input ceiling enforced by a deterministic conservative bound: the
 	// token estimate of the whole request body (system prompt, user payload, strict JSON schema and
@@ -54,9 +54,9 @@ var (
 func IsProviderTransient(err error) bool { return errors.Is(err, ErrProviderTransient) }
 
 type Candidate struct {
-	Merchant  string   `json:"merchant"`
-	Direction string   `json:"direction"`
-	Method    string   `json:"method,omitempty"`
+	Merchant   string   `json:"merchant"`
+	Direction  string   `json:"direction"`
+	Method     string   `json:"method,omitempty"`
 	Categories []string `json:"categories"`
 }
 
@@ -167,17 +167,31 @@ func allowedCode(code string) bool {
 }
 
 func ValidateResults(results []Result, candidates []Candidate) error {
-	if len(results) != len(candidates) { return ErrInvalidOutput }
+	if len(results) != len(candidates) {
+		return ErrInvalidOutput
+	}
 	seen := make([]bool, len(candidates))
 	for _, r := range results {
 		idx := caseIDIndex(r.CaseID)
-		if idx < 0 || idx >= len(candidates) || seen[idx] { return ErrInvalidOutput }
+		if idx < 0 || idx >= len(candidates) || seen[idx] {
+			return ErrInvalidOutput
+		}
 		seen[idx] = true
-		if !allowedCode(r.CategoryCode) { return ErrInvalidOutput }
-		if len(r.ReasonCode) > 40 || strings.ContainsAny(r.ReasonCode, "\r\n") { return ErrInvalidOutput }
-		if r.NeedsReview && r.CategoryCode != "uncategorized" { return ErrInvalidOutput }
+		if !allowedCode(r.CategoryCode) {
+			return ErrInvalidOutput
+		}
+		if len(r.ReasonCode) > 40 || strings.ContainsAny(r.ReasonCode, "\r\n") {
+			return ErrInvalidOutput
+		}
+		if r.NeedsReview && r.CategoryCode != "uncategorized" {
+			return ErrInvalidOutput
+		}
 	}
-	for _, ok := range seen { if !ok { return ErrInvalidOutput } }
+	for _, ok := range seen {
+		if !ok {
+			return ErrInvalidOutput
+		}
+	}
 	return nil
 }
 
@@ -192,7 +206,12 @@ func CaseIDForIndex(i int) string { return caseID(i) }
 func CaseIndex(id string) int { return caseIDIndex(id) }
 
 func caseIDIndex(id string) int {
-	if len(id) < 2 || id[0] != 'c' { return -1 }
-	n, err := strconv.Atoi(id[1:]); if err != nil { return -1 }
+	if len(id) < 2 || id[0] != 'c' {
+		return -1
+	}
+	n, err := strconv.Atoi(id[1:])
+	if err != nil {
+		return -1
+	}
 	return n
 }

@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 )
 
 // TestCategorySearchNormalizationKindPagingAndIsolation locks the C10 search contract: q matches

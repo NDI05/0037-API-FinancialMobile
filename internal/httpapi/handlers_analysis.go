@@ -21,7 +21,6 @@ type analysisRequest struct {
 	Payload       json.RawMessage `json:"payload"`
 }
 
-
 // invalidAnalysisRequest writes the contract 400 and records the validation reason, which is a
 // field name only (never the payload or an amount), so a failing client can be diagnosed from the
 // server log without storing owner data.
