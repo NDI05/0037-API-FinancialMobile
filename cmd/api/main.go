@@ -78,6 +78,12 @@ func run() error {
 	if cfg.CategoryLLM.Enabled {
 		worker.Start()
 	}
+	// CR-005 retention schedule: off unless explicitly enabled. It is report-only unless
+	// deletion is separately enabled with the internal token configured (config.Load enforces it).
+	retentionWorker := httpapi.NewRetentionWorker(api)
+	if cfg.Retention.SweepEnabled {
+		retentionWorker.Start()
+	}
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           api.Handler(),
@@ -107,6 +113,9 @@ func run() error {
 	// reclaimed by the next process after their lease expires (recovery path, not data loss).
 	if cfg.CategoryLLM.Enabled {
 		worker.Stop()
+	}
+	if cfg.Retention.SweepEnabled {
+		retentionWorker.Stop()
 	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

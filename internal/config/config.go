@@ -41,6 +41,7 @@ type Config struct {
 	KeyVersion         int
 	LLM                LLM
 	CategoryLLM        CategoryLLM
+	Retention          Retention
 	Limits             Limits
 	Warnings           []string
 }
@@ -87,6 +88,15 @@ type CategoryLLM struct {
 	InstallAttemptsDay int
 	PromptPer1K      float64
 	CompletionPer1K  float64
+}
+
+// Retention controls the scheduled CR-005 cleanup. Both switches default to off: the server never
+// scans or deletes financial data unless an operator explicitly turns it on. REPORT_ONLY is the
+// default mode; deletion additionally needs DeleteEnabled and INTERNAL_SWEEP_TOKEN.
+type Retention struct {
+	SweepEnabled  bool
+	DeleteEnabled bool
+	SweepInterval time.Duration
 }
 
 type Limits struct {
@@ -147,6 +157,10 @@ func Load(env map[string]string) (*Config, error) {
 			PromptPer1K:      floatValue(env, "CATEGORY_LLM_PRICE_PROMPT_PER_1K_USD", 0),
 			CompletionPer1K:  floatValue(env, "CATEGORY_LLM_PRICE_COMPLETION_PER_1K_USD", 0),
 		},
+		Retention: Retention{
+			SweepEnabled:  boolValue(env, "RETENTION_SWEEP_ENABLED", false),
+			DeleteEnabled: boolValue(env, "RETENTION_DELETE_ENABLED", false),
+		},
 		Limits: Limits{
 			AnalysesPerHour: intValue(env, "RATE_LIMIT_ANALYSES_PER_HOUR", 10),
 			AnalysesPerDay:  intValue(env, "RATE_LIMIT_ANALYSES_PER_DAY", 40),
@@ -161,6 +175,28 @@ func Load(env map[string]string) (*Config, error) {
 		return nil, fmt.Errorf("PORT must be an integer 0..65535")
 	}
 	cfg.Port = port
+
+	retentionHours := 24
+	if raw := get(env, "RETENTION_SWEEP_INTERVAL_HOURS", ""); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("RETENTION_SWEEP_INTERVAL_HOURS must be 1..168")
+		}
+		retentionHours = parsed
+	}
+	if retentionHours < 1 || retentionHours > 168 {
+		return nil, fmt.Errorf("RETENTION_SWEEP_INTERVAL_HOURS must be 1..168")
+	}
+	cfg.Retention.SweepInterval = time.Duration(retentionHours) * time.Hour
+	if cfg.Retention.DeleteEnabled {
+		// Deletion is only reachable through the same token as the existing internal sweep. A
+		// delete-enabled schedule without a token would be an unauthenticated destructive path, so
+		// the configuration fails closed instead of silently downgrading to report-only.
+		if cfg.InternalSweepToken == "" {
+			return nil, fmt.Errorf("RETENTION_DELETE_ENABLED requires INTERNAL_SWEEP_TOKEN")
+		}
+		cfg.Retention.SweepEnabled = true
+	}
 
 	accessSeconds := intValue(env, "ACCESS_TOKEN_TTL_SECONDS", int(DefaultAccessTTL/time.Second))
 	if accessSeconds < 60 || accessSeconds > 900 {

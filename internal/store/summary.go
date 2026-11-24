@@ -9,6 +9,7 @@ import (
 
 	"github.com/pam/recap/backend-go/internal/crypto"
 	"github.com/pam/recap/backend-go/internal/finance"
+	"github.com/pam/recap/backend-go/internal/retention"
 )
 
 type Summary struct {
@@ -44,11 +45,18 @@ type StoredSummary struct {
 }
 
 // ComputeSummary reads only active rows for one owner/month and applies the deterministic rules.
+// For the boundary month it aggregates only the retained part of the month, so a clipped period
+// never reports aggregates over data the retention policy has already expired.
 func (s *Store) ComputeSummary(ctx context.Context, ownerID, monthID string, now time.Time) (Summary, error) {
 	start, end, err := ParseMonth(monthID)
 	if err != nil {
 		return Summary{}, err
 	}
+	window := retention.NewWindow(now)
+	if err := window.ValidateMonth(start, end); err != nil {
+		return Summary{}, err
+	}
+	start = window.ClampMonthStart(start)
 	rows, err := s.DB.QueryContext(ctx, `SELECT t.id, COALESCE(t.category_id, ''),
 		COALESCE(c.code, ''), COALESCE(c.kind, 'UNCATEGORIZED'), t.direction, t.source,
 		t.amount_minor, t.is_internal_transfer, COALESCE(t.linked_refund_of, '')

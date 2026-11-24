@@ -108,6 +108,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/deletion-requests/{id}", s.authed(s.getDeletion))
 	mux.HandleFunc("GET /v1/deletion-receipts/{token}", s.getDeletionReceipt)
 	mux.HandleFunc("POST /v1/internal/sweep", s.internalSweep)
+	// Retention surface (CR-005): the public GET lets clients clamp their period picker; the
+	// internal sweep is token-gated and report-only unless deletion is explicitly enabled.
+	mux.Handle("GET /v1/retention", s.authed(s.retentionInfo))
+	mux.HandleFunc("POST /v1/internal/retention-sweep", s.internalRetentionSweep)
 	return s.middleware(mux)
 }
 
@@ -145,6 +149,10 @@ func sanitizedRoute(path string) string {
 	case path == "/v1/deletion-receipts" || strings.HasPrefix(path, "/v1/deletion-receipts/"):
 		return "/v1/deletion-receipts/{token}"
 	case path == "/v1/internal/sweep":
+		return path
+	case path == "/v1/internal/retention-sweep":
+		return path
+	case path == "/v1/retention":
 		return path
 	case strings.HasPrefix(path, "/v1/transactions/"):
 		return "/v1/transactions/{id}"

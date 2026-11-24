@@ -41,6 +41,9 @@ func (s *Server) createAnalysis(w http.ResponseWriter, r *http.Request) {
 		s.invalidAnalysisRequest(w, r, "monthId must be YYYY-MM")
 		return
 	}
+	if !s.retainMonth(w, r, body.MonthID) {
+		return
+	}
 	if len(body.Payload) == 0 {
 		s.invalidAnalysisRequest(w, r, "payload is required")
 		return
@@ -241,6 +244,9 @@ func (s *Server) recordProviderUsage(ownerID string, response store.AnalysisResp
 func (s *Server) getAnalysis(w http.ResponseWriter, r *http.Request) {
 	info, _ := authFrom(r)
 	monthID := r.PathValue("monthID")
+	if !s.retainMonth(w, r, monthID) {
+		return
+	}
 	record, err := s.Store.LatestAnalysis(r.Context(), info.OwnerID, monthID)
 	if err != nil {
 		s.mapWriteError(w, r, err)

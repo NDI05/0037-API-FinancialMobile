@@ -52,6 +52,10 @@ func (s *Server) createImportJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "consent_required", "Gmail consent has not been granted", correlationOf(r))
 		return
 	}
+	// Import is the backfill path: only months inside the rolling window may be created.
+	if !s.retainMonth(w, r, body.MonthID) {
+		return
+	}
 	job, err := s.Store.CreateImportJob(r.Context(), info.OwnerID, body.MonthID, body.TemplateVersion, s.Now())
 	if err != nil {
 		s.mapWriteError(w, r, err)
@@ -86,11 +90,17 @@ func (s *Server) importBatch(w http.ResponseWriter, r *http.Request) {
 		s.mapWriteError(w, r, err)
 		return
 	}
+	if !s.retainMonth(w, r, job.MonthID) {
+		return
+	}
 	candidates := make([]store.ImportCandidate, 0, len(body.Candidates))
 	for _, candidate := range body.Candidates {
 		eventAt, err := time.Parse(time.RFC3339, candidate.EventAt)
 		if candidate.Status == "PARSED" && err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", "candidate eventAt must be RFC3339", correlationOf(r))
+			return
+		}
+		if candidate.Status == "PARSED" && !s.retainEventAt(w, r, eventAt) {
 			return
 		}
 		candidates = append(candidates, store.ImportCandidate{
