@@ -284,7 +284,7 @@ func TestCategoryReassignAfterUse(t *testing.T) {
 	categoryID := created["id"].(string)
 	status, tx := h.request("POST", "/v1/transactions", token, map[string]any{
 		"direction": "DEBIT", "amountMinor": 2_500_000, "currency": "IDR",
-		"eventAt": "2026-12-02T03:00:00Z", "categoryId": categoryID,
+		"eventAt": h.api.Now().UTC().Format(time.RFC3339), "categoryId": categoryID,
 	})
 	if status != 201 {
 		t.Fatalf("tx create: %d %#v", status, tx)

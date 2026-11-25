@@ -249,7 +249,8 @@ func (s *Server) createTransaction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "eventAt must be RFC3339", correlationOf(r))
 		return
 	}
-	// Backfill older than the rolling window is out of policy; the store enforces the same bound.
+	// Reject expired requests before replay lookup. The idempotent store checks the full
+	// window for new writes while preserving exact retries of already committed records.
 	if !s.retainNotExpired(w, r, eventAt) {
 		return
 	}

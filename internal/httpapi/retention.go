@@ -68,9 +68,8 @@ func (s *Server) retainEventAt(w http.ResponseWriter, r *http.Request, at time.T
 	return true
 }
 
-// retainNotExpired rejects already-expired data on direct read/write paths. It deliberately keeps
-// the legacy future-dated behaviour of manual entry; period endpoints use retainMonth, which also
-// rejects future periods.
+// retainNotExpired keeps legacy rows accessible on direct resource paths and preserves
+// idempotent retries. New records are validated against the full window before insertion.
 func (s *Server) retainNotExpired(w http.ResponseWriter, r *http.Request, at time.Time) bool {
 	if err := s.retentionWindow().ValidateNotExpired(at); err != nil {
 		s.writeOutsideRetention(w, r)

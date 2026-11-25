@@ -4,10 +4,75 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pam/recap/backend-go/internal/categoryllm"
+	"github.com/pam/recap/backend-go/internal/gmail"
 	"github.com/pam/recap/backend-go/internal/store"
 )
+
+func TestInitialBackfillHoldsCategoryQueueUntilEveryMonthCompletes(t *testing.T) {
+	stub := &stubCategory{}
+	h := newCategoryHarness(t, stub)
+	h.register("initial-category@example.test")
+	token, _ := h.login("initial-category@example.test")
+	h.grantCategoryConsent(token)
+	txID := h.queueTx(token, "d"+strings.Repeat("1", 31), "BAKSO UJI", "QRIS BAKSO")
+	ctx := context.Background()
+	owner, now := h.ownerID(), h.api.Now()
+	service := gmail.NewService(h.store, nil, nil, gmail.Settings{}, testLogger())
+	h.api.SetGmail(service, nil)
+	if _, err := h.store.SaveGmailConnection(ctx, store.GmailConnectionInput{
+		OwnerID: owner, AccountEmail: "initial-category@gmail.test",
+		RefreshToken: "fixture-only", Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := h.api.EnqueueImported(ctx, owner, []string{txID}); err != nil || queued != 1 {
+		t.Fatalf("enqueue=%d err=%v", queued, err)
+	}
+	if err := h.api.DrainOwner(ctx, owner); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := h.request("POST", "/v1/category-jobs/drain", token, nil); status != 200 || body["state"] != "not_due" {
+		t.Fatalf("drain=%d %v", status, body)
+	}
+	if status, body := h.request("POST", "/v1/category-jobs", token, map[string]any{"transactionIds": []string{txID}}); status != 200 {
+		t.Fatalf("manual category request=%d %v", status, body)
+	}
+	NewCategoryWorker(h.api).tick()
+	if stub.calls != 0 || h.pendingQueue() != 1 {
+		t.Fatalf("category work ran before initial coverage: calls=%d pending=%d", stub.calls, h.pendingQueue())
+	}
+
+	zone := time.FixedZone("WIB", 7*60*60)
+	local := now.In(zone)
+	monthStart := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, zone)
+	for offset := 0; offset <= 12; offset++ {
+		start := monthStart.AddDate(0, -offset, 0)
+		job, err := h.store.EnsureGmailBackfillJob(ctx, owner, start.Format("2006-01"), start, start.AddDate(0, 1, 0), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.store.FinishGmailSyncJob(ctx, owner, job.ID, "COMPLETE", "", now); err != nil {
+			t.Fatal(err)
+		}
+		if offset == 11 {
+			NewCategoryWorker(h.api).tick()
+			if stub.calls != 0 {
+				t.Fatalf("oldest partial month was bypassed: calls=%d", stub.calls)
+			}
+		}
+	}
+	NewCategoryWorker(h.api).tick()
+	NewCategoryWorker(h.api).tick()
+	if stub.calls != 1 || h.pendingQueue() != 0 {
+		t.Fatalf("completed coverage drain: calls=%d pending=%d", stub.calls, h.pendingQueue())
+	}
+	if waiting, err := service.InitialBackfillPending(ctx, owner, now.AddDate(0, 1, 0)); err != nil || waiting {
+		t.Fatalf("new calendar month reopened initial gate: waiting=%t err=%v", waiting, err)
+	}
+}
 
 // These tests cover the server-side half of the Gmail category bridge: the Gmail worker calls
 // EnqueueImported/DrainOwner after an acknowledged import page, exactly like this.

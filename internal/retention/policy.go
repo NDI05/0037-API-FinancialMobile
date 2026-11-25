@@ -123,10 +123,8 @@ func (w Window) ExpiredBeforeMonthID() string { return w.StartMonthID() }
 // old side. Data exactly at Start is retained.
 func (w Window) Expired(t time.Time) bool { return t.Before(w.Start) }
 
-// ValidateNotExpired rejects expired financial data while leaving the upper bound to the
-// period-selection checks. Manual entry and direct resource reads use this lower-bound guard so
-// existing future-dated behaviour does not change; month/period endpoints use ValidateMonth, which
-// also rejects future periods.
+// ValidateNotExpired is the lower-bound guard for legacy direct resource access and replays.
+// ValidateEventAt checks both bounds for new financial records.
 func (w Window) ValidateNotExpired(t time.Time) error {
 	if w.Expired(t) {
 		return fmt.Errorf("%w: data is older than %s",

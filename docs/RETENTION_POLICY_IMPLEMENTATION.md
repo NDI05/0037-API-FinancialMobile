@@ -51,9 +51,10 @@ Deliberate exemptions and decisions:
 
 - **Budget plan / FR-42 is not touched.** `budget_plans`/`budget_limits` are never guarded by
   retention checks and never deleted by the sweep; budget behavior is unchanged.
-- Future-dated **manual** entries keep their previous behavior for create/read: the direct
-  transaction read path only enforces the **lower** bound (`eventAt < windowStart`), so a future
-  event date that already existed keeps working. Period endpoints still reject future months.
+- New manual transactions must pass both `windowStart` and the current instant. Older clients'
+  already acknowledged requests can still replay the same key and original payload without
+  writing a new row. A legacy row with a future timestamp remains available on the direct
+  resource path. Period endpoints still reject future months.
 - Direct transaction reads (`GET /v1/transactions/{id}`) only enforce the lower bound, because
   cleanup is what actually removes fully expired rows. Attachment metadata resolved by id enforces
   the same one-year window as its list/create paths; an attachment whose transaction is already

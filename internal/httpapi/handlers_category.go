@@ -95,6 +95,11 @@ func (s *Server) createCategoryJobs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "transactionIds must contain 1..5 ids", correlationOf(r))
 		return
 	}
+	waiting, err := s.categoryAwaitingInitialBackfill(r.Context(), info.OwnerID, s.Now())
+	if err != nil {
+		s.databaseOrInternal(w, r, err)
+		return
+	}
 	seen := map[string]bool{}
 	var jobs []store.CategoryJob
 	var pending []preparedCategory
@@ -120,7 +125,7 @@ func (s *Server) createCategoryJobs(w http.ResponseWriter, r *http.Request) {
 				job = reset
 			}
 		}
-		if job.State != "PENDING" {
+		if waiting || job.State != "PENDING" {
 			// Duplicate tap: replay the existing job id; the winning request calls the provider.
 			jobs = append(jobs, job)
 			continue

@@ -149,6 +149,13 @@ func (s *Server) drainOwnerQueue(ctx context.Context, ownerID string, now time.T
 		out.State = "empty"
 		return out, nil
 	}
+	waiting, err := s.categoryAwaitingInitialBackfill(ctx, ownerID, now)
+	if err != nil {
+		return out, err
+	}
+	if waiting {
+		return drainOutcome{State: "not_due", Pending: pending}, nil
+	}
 	if !ignoreDue && state.NextDrainAt != nil && now.Before(*state.NextDrainAt) {
 		out.State = "not_due"
 		out.Pending = pending
@@ -277,6 +284,10 @@ func (s *Server) applyCachedQueuedJobs(ctx context.Context, ownerID string, now 
 	classifier := s.CategoryClassifier
 	if classifier == nil {
 		return 0, nil
+	}
+	waiting, err := s.categoryAwaitingInitialBackfill(ctx, ownerID, now)
+	if err != nil || waiting {
+		return 0, err
 	}
 	jobs, err := s.Store.ListAllQueuedCategoryJobs(ctx, ownerID, limit)
 	if err != nil {
@@ -431,6 +442,13 @@ func drainResponse(state string, drained, pending int, next *time.Time, jobs []c
 
 func (s *Server) autoCategoryEnabled() bool {
 	return s.CategoryClassifier != nil && s.Config.CategoryLLM.Enabled
+}
+
+func (s *Server) categoryAwaitingInitialBackfill(ctx context.Context, ownerID string, now time.Time) (bool, error) {
+	if s.Gmail == nil {
+		return false, nil
+	}
+	return s.Gmail.InitialBackfillPending(ctx, ownerID, now)
 }
 
 func (s *Server) autoCategoryConsented(r *http.Request) bool {

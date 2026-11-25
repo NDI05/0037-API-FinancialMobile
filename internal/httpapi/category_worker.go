@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -110,6 +111,12 @@ func (w *CategoryWorker) tick() {
 // observes or executes another owner's jobs.
 func (w *CategoryWorker) processRecovered(ctx context.Context, job store.CategoryJob) error {
 	s := w.server
+	now := s.Now()
+	waiting, err := s.categoryAwaitingInitialBackfill(ctx, job.OwnerID, now)
+	if err != nil || waiting {
+		_, releaseErr := s.Store.ReleaseCategoryJob(ctx, job.OwnerID, job.ID, job.LeaseToken, now)
+		return errors.Join(err, releaseErr)
+	}
 	prepared, eligible, err := s.prepareForClassify(ctx, job.OwnerID, job)
 	if err != nil {
 		return err

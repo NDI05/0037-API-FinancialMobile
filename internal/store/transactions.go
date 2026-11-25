@@ -119,10 +119,7 @@ func (s *Store) CreateTransaction(ctx context.Context, ownerID string, input Tra
 	if input.EventAt.IsZero() {
 		return Transaction{}, fmt.Errorf("eventAt is required")
 	}
-	// Backfilling older than the one-year window is rejected here as well as at the HTTP boundary.
-	// Future-dated manual entries keep their existing behaviour; the window upper bound applies to
-	// period selection (list/summary/analysis/import), not to this legacy entry path.
-	if err := retention.NewWindow(now).ValidateNotExpired(input.EventAt); err != nil {
+	if err := retention.NewWindow(now).ValidateEventAt(input.EventAt); err != nil {
 		return Transaction{}, err
 	}
 	id := NewID("tx")

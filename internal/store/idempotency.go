@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pam/recap/backend-go/internal/crypto"
+	"github.com/pam/recap/backend-go/internal/retention"
 )
 
 type TransactionCreateResult struct {
@@ -110,6 +111,9 @@ func (s *Store) tryCreateIdempotent(ctx context.Context, ownerID, key, requestHa
 		return TransactionCreateResult{}, false, err
 	}
 
+	if err := retention.NewWindow(now).ValidateEventAt(input.EventAt); err != nil {
+		return TransactionCreateResult{}, false, err
+	}
 	id := NewID("tx")
 	_, err = tx.ExecContext(ctx, `INSERT INTO transactions
 		(id, owner_id, category_id, direction, source, amount_minor, currency, event_at_ms,

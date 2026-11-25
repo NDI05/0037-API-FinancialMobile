@@ -985,6 +985,37 @@ func (s *Service) BackfillPending(ctx context.Context, ownerID string, now time.
 	return s.backfillPending(ctx, connection, now), nil
 }
 
+// InitialBackfillPending tests the retained months belonging to the mailbox's initial import.
+// A new calendar month after that import does not reopen the initial classification gate.
+func (s *Service) InitialBackfillPending(ctx context.Context, ownerID string, now time.Time) (bool, error) {
+	connection, err := s.Store.GetGmailConnection(ctx, ownerID)
+	if errors.Is(err, store.ErrGmailNotConnected) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if connection.State == "DISCONNECTED" {
+		return false, nil
+	}
+	initial := s.backfillMonths(connection.ConnectedAt)
+	current := monthSet(s.backfillMonths(now))
+	if len(initial) == 0 {
+		return false, nil
+	}
+	since, _ := monthWindow(initial[len(initial)-1])
+	completed, err := s.Store.CompletedGmailBackfillMonths(ctx, ownerID, since)
+	if err != nil {
+		return false, err
+	}
+	for _, month := range initial {
+		if current[month] && !completed[month] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Service) backfillPending(ctx context.Context, connection store.GmailConnection,
 	now time.Time) bool {
 	months := s.backfillMonths(now)

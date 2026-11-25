@@ -110,13 +110,28 @@ func TestRetentionInfoAndPeriodGuards(t *testing.T) {
 		t.Fatalf("boundary month list = %d %#v", status, body)
 	}
 
-	// Backfill older than the window is a safe 4xx, not a 500.
+	// Records outside either bound are rejected before inserting a new transaction.
 	status, body := h.request("POST", "/v1/transactions", token, map[string]any{
 		"direction": "DEBIT", "amountMinor": 1000, "currency": "IDR",
 		"eventAt": "2024-01-15T00:00:00Z",
 	})
 	if status != 400 || body["code"] != "outside_retention" {
 		t.Fatalf("expired transaction create = %d %#v, want 400 outside_retention", status, body)
+	}
+	for _, tc := range []struct {
+		at   time.Time
+		want int
+	}{
+		{h.api.Now().Add(time.Second), 400},
+		{h.api.Now().Truncate(time.Second), 201},
+	} {
+		status, body := h.request("POST", "/v1/transactions", token, map[string]any{
+			"direction": "DEBIT", "amountMinor": 1000, "currency": "IDR",
+			"eventAt": tc.at.Format(time.RFC3339),
+		})
+		if status != tc.want || (status == 400 && body["code"] != "outside_retention") {
+			t.Fatalf("transaction at %s = %d %#v, want %d", tc.at, status, body, tc.want)
+		}
 	}
 	status, body = h.request("PUT", "/v1/summaries/2024-01", token, map[string]any{
 		"inputRevision": 1, "payload": map[string]any{"monthId": "2024-01"},
