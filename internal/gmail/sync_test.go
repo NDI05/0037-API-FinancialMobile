@@ -651,11 +651,11 @@ func TestGmailBackfillMergesExistingIMAPRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	imapCandidate := store.ImportCandidate{
-		Fingerprint:   f.Store.IngestFingerprint("1234:42", "KOPI KENANGAN", "DEBIT", 25000, eventAt),
+		Fingerprint:   f.Store.IngestFingerprint("1234:42", "KOPI KENANGAN", "DEBIT", 2_500_000, eventAt),
 		SourceRef:     "1234:42",
 		Status:        "PARSED",
 		Direction:     "DEBIT",
-		AmountMinor:   25000,
+		AmountMinor:   2_500_000,
 		EventAt:       eventAt,
 		ParserVersion: "livin-v1",
 		Confidence:    1,

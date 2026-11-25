@@ -34,8 +34,8 @@ func TestSchemaHasExactly21Migrations(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 21 {
-		t.Fatalf("migration count = %d, want 21", count)
+	if count != 22 {
+		t.Fatalf("migration count = %d, want 22", count)
 	}
 }
 
@@ -82,8 +82,8 @@ func TestUpgradeFrom020AppliesGoogleSSO(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 21 {
-		t.Fatalf("upgraded migrations = %d, want 21", count)
+	if count != 22 {
+		t.Fatalf("upgraded migrations = %d, want 22", count)
 	}
 	s := New(db, make([]byte, 32), 1)
 	owner := OwnerIDForEmail("upgrade@example.test")

@@ -1,7 +1,6 @@
 package gmail
 
 import (
-	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,8 +27,10 @@ type ParsedNotification struct {
 	Reference     string
 }
 
-// TemplateVersion identifies the parser generation stored with imported rows.
-const TemplateVersion = "gmail-livin-v2"
+// TemplateVersion identifies the parser generation stored with imported rows. v3 parses every
+// printed rupiah amount into minor units (1/100 IDR); v1/v2 stored whole rupiah, which made every
+// imported row look 100x smaller than the same amount entered manually.
+const TemplateVersion = "gmail-livin-v3"
 
 var (
 	jakarta = mustLoadJakarta()
@@ -365,12 +366,13 @@ func findAmount(lines []string) (int64, bool) {
 	return 0, false
 }
 
-// parseIDRAmount turns a printed rupiah amount into minor units. IDR has no circulating cents, so
-// "25.000", "25.000,00" and "25,000.00" all become 25000. Ambiguous merges are rejected instead
-// of guessed.
+// parseIDRAmount turns a printed rupiah amount into minor units (1/100 IDR), the unit the API
+// contract and the Android client use. "25.000", "25.000,00" and "25,000.00" all become
+// 2_500_000, while "25.000,50" becomes 2_500_050. Ambiguous merges are rejected instead of
+// guessed: a separator followed by three digits is grouping, a final two-digit group is cents.
 func parseIDRAmount(raw string) (int64, bool) {
 	raw = strings.TrimSpace(raw)
-	raw = strings.TrimRight(raw, ".,")
+	raw = strings.TrimRight(raw, ".-")
 	if raw == "" {
 		return 0, false
 	}
@@ -400,12 +402,26 @@ func parseIDRAmount(raw string) (int64, bool) {
 			raw = strings.ReplaceAll(raw, ".", "")
 		}
 	}
-	value, err := strconv.ParseFloat(raw, 64)
-	if err != nil || value <= 0 {
+	major, fraction, _ := strings.Cut(raw, ".")
+	if major == "" || len(fraction) > 2 {
 		return 0, false
 	}
-	// Round to the nearest rupiah: a printed value with cents still has one real IDR amount.
-	minor := int64(math.Round(value))
+	for _, ch := range fraction {
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+	}
+	whole, err := strconv.ParseInt(major, 10, 64)
+	if err != nil || whole < 0 || whole > 10_000_000_000_000 {
+		return 0, false
+	}
+	var cents int64
+	if len(fraction) == 1 {
+		cents = int64(fraction[0]-'0') * 10
+	} else if len(fraction) == 2 {
+		cents = int64(fraction[0]-'0')*10 + int64(fraction[1]-'0')
+	}
+	minor := whole*100 + cents
 	if minor <= 0 || minor > 1_000_000_000_000_000 {
 		return 0, false
 	}

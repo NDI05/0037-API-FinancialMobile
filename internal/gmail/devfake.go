@@ -263,7 +263,7 @@ func devSyntheticEmail(message DevFixtureMessage) []byte {
 	reference := "DEV" + strings.ReplaceAll(strings.ReplaceAll(message.ID, "-", ""), "_", "")
 	body := "Pembayaran Berhasil\r\n" +
 		"Penerima: " + merchant + "\r\n" +
-		"Jumlah: Rp " + devThousands(message.AmountMinor) + "\r\n" +
+		"Jumlah: Rp " + devMinorText(message.AmountMinor) + "\r\n" +
 		"Tanggal: " + local.Format("02 Jan 2006 15:04:05") + "\r\n" +
 		"No. Referensi: " + reference + "\r\n"
 	return []byte("From: Livin <no-reply@livin.co.id>\r\n" +
@@ -275,16 +275,22 @@ func devSyntheticEmail(message DevFixtureMessage) []byte {
 		"\r\n" + body)
 }
 
-// devThousands renders minor units as the Indonesian "Rp 25.000" grouping the parser accepts.
-func devThousands(amountMinor int64) string {
-	digits := strconv.FormatInt(amountMinor, 10)
+// devMinorText renders a minor-unit amount the way a Livin notification prints it, so the parser
+// (not the fake) recovers exactly amountMinor. 999000 minor is printed as "9.990", not "999.000".
+func devMinorText(amountMinor int64) string {
+	major := amountMinor / 100
+	digits := strconv.FormatInt(major, 10)
 	parts := []string{}
 	for len(digits) > 3 {
 		parts = append([]string{digits[len(digits)-3:]}, parts...)
 		digits = digits[:len(digits)-3]
 	}
 	parts = append([]string{digits}, parts...)
-	return strings.Join(parts, ".")
+	text := strings.Join(parts, ".")
+	if cents := amountMinor % 100; cents != 0 {
+		text += fmt.Sprintf(",%02d", cents)
+	}
+	return text
 }
 
 func (p *DevFakeProvider) Watch(ctx context.Context, accessToken, topic string) (WatchState, error) {

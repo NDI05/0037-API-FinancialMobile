@@ -48,8 +48,8 @@ func TestParseLivinPrefersBusinessNameAndNeverPAN(t *testing.T) {
 			t.Fatalf("identifier %s leaked into a stored label", identifier)
 		}
 	}
-	if parsed.AmountMinor != 25000 {
-		t.Fatalf("amount = %d, want 25000", parsed.AmountMinor)
+	if parsed.AmountMinor != 2_500_000 {
+		t.Fatalf("amount = %d, want 2500000 minor units", parsed.AmountMinor)
 	}
 	if parsed.Direction != "DEBIT" {
 		t.Fatalf("direction = %s", parsed.Direction)
@@ -95,11 +95,16 @@ func TestParseLivinCreditAndTemplateGuard(t *testing.T) {
 
 func TestParseIDRAmountVariants(t *testing.T) {
 	cases := map[string]int64{
-		"25.000":    25000,
-		"25.000,00": 25000,
-		"25,000.00": 25000,
-		"25000":     25000,
-		"1.250.000": 1250000,
+		"25.000":       2_500_000,
+		"25.000,00":    2_500_000,
+		"25,000.00":    2_500_000,
+		"25000":        2_500_000,
+		"1.250.000":    125_000_000,
+		"100.000":      10_000_000,
+		"2.500.000":    250_000_000,
+		"25.000,50":    2_500_050,
+		"1.000.000,00": 100_000_000,
+		"9.990":        999_000,
 	}
 	for raw, want := range cases {
 		got, ok := parseIDRAmount(raw)
@@ -109,6 +114,25 @@ func TestParseIDRAmountVariants(t *testing.T) {
 	}
 	if _, ok := parseIDRAmount(""); ok {
 		t.Fatal("empty amount must be rejected")
+	}
+}
+
+// A synthetic fixture once printed minor units as if they were whole rupiah, so every test passed
+// while production rows were 100x too small. The fixture must now print the amount a real Livin
+// notification prints and the parser must return the exact minor-unit value the fixture declared.
+func TestDevFixtureRoundTripsMinorAmounts(t *testing.T) {
+	for _, minor := range []int64{100, 999_000, 2_500_000, 12_345_678} {
+		raw := devSyntheticEmail(DevFixtureMessage{
+			ID: "fx-roundtrip", EventAt: "2026-11-20T04:30:00Z", AmountMinor: minor})
+		decoded, err := DecodeMessage(raw)
+		if err != nil {
+			t.Fatalf("decode fixture %d: %v", minor, err)
+		}
+		parsed := ParseLivinNotification(decoded)
+		if parsed.Status != "PARSED" || parsed.AmountMinor != minor {
+			t.Fatalf("fixture amountMinor=%d parsed as status=%s amount=%d", minor,
+				parsed.Status, parsed.AmountMinor)
+		}
 	}
 }
 
@@ -126,7 +150,7 @@ func TestDecodeMessageMultipartBase64(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsed := ParseLivinNotification(decoded)
-	if parsed.Status != "PARSED" || parsed.MerchantLabel != "KOPI KENANGAN" || parsed.AmountMinor != 25000 {
+	if parsed.Status != "PARSED" || parsed.MerchantLabel != "KOPI KENANGAN" || parsed.AmountMinor != 2_500_000 {
 		t.Fatalf("multipart/base64 body not decoded: %+v", parsed)
 	}
 }
@@ -158,8 +182,8 @@ Terima kasih telah menggunakan Livin' by Mandiri.
 	if parsed.MerchantLabel != "WARUNG SEDERHANA" {
 		t.Fatalf("merchant = %q, want WARUNG SEDERHANA", parsed.MerchantLabel)
 	}
-	if parsed.AmountMinor != 25000 {
-		t.Fatalf("amount = %d, want 25000", parsed.AmountMinor)
+	if parsed.AmountMinor != 2_500_000 {
+		t.Fatalf("amount = %d, want 2500000 minor units", parsed.AmountMinor)
 	}
 	want := time.Date(2026, 11, 24, 9, 30, 45, 0, jakarta)
 	if !parsed.EventAt.Equal(want) {
