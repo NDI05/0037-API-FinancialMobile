@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pam/recap/backend-go/internal/auth"
 	"github.com/pam/recap/backend-go/internal/store"
 )
 
@@ -65,6 +66,11 @@ func (s *Server) googleNonce(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusInternalServerError, "internal_error", "Unexpected error", correlationOf(r))
 }
 
+// googleLogin is both the direct login and the direct registration path. A verified Google identity
+// that is already linked logs straight in. Otherwise the identity auto-links to the account that
+// owns the same verified email, or provisions a fresh USER account when no account owns it. Owner
+// decision overrides the older CR-008 "never auto-create" rule; the security invariant is that only
+// a verified email can claim or create an account.
 func (s *Server) googleLogin(w http.ResponseWriter, r *http.Request) {
 	if s.googleSSODisabled(w, r) {
 		return
@@ -98,24 +104,52 @@ func (s *Server) googleLogin(w http.ResponseWriter, r *http.Request) {
 			correlationOf(r))
 		return
 	}
+	now := s.Now()
+	var account store.Account
 	identity, err := s.Store.FindGoogleIdentity(r.Context(), claims.Issuer, claims.Subject)
-	if err != nil {
-		if errors.Is(err, store.ErrGoogleIdentityNotLinked) {
-			// No account is created and no email match is attempted: linking is explicit.
-			writeError(w, http.StatusConflict, "google_identity_not_linked",
-				"This Google account is not linked to a PAM account", correlationOf(r))
+	switch {
+	case err == nil:
+		// Linked fast path: the link table stays authoritative even if the Google email changed.
+		account, err = s.Store.FindAccountByOwner(r.Context(), identity.OwnerID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusConflict, "google_identity_not_linked",
+					"This Google account is not linked to a PAM account", correlationOf(r))
+				return
+			}
+			s.databaseOrInternal(w, r, err)
 			return
 		}
-		s.databaseOrInternal(w, r, err)
-		return
-	}
-	account, err := s.Store.FindAccountByOwner(r.Context(), identity.OwnerID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusConflict, "google_identity_not_linked",
-				"This Google account is not linked to a PAM account", correlationOf(r))
+	case errors.Is(err, store.ErrGoogleIdentityNotLinked):
+		// An unverified address is not proof of ownership, so it can neither create an account
+		// nor claim an existing one.
+		if !claims.EmailVerified || claims.Email == "" {
+			writeError(w, http.StatusForbidden, "google_email_unverified",
+				"Google did not verify this account's email address", correlationOf(r))
 			return
 		}
+		digest, digestErr := googleAccountDigest()
+		if digestErr != nil {
+			s.Log.Error("request_failed", "correlationId", correlationOf(r),
+				"error", digestErr.Error())
+			writeError(w, http.StatusInternalServerError, "internal_error", "Unexpected error",
+				correlationOf(r))
+			return
+		}
+		result, loginErr := s.Store.FindOrCreateAccountForGoogle(r.Context(), claims.Issuer,
+			claims.Subject, claims.Email, googleDisplayName(claims), digest, now)
+		if loginErr != nil {
+			if errors.Is(loginErr, store.ErrGoogleIdentityConflict) {
+				writeError(w, http.StatusConflict, "google_identity_conflict",
+					"This email belongs to a PAM account linked to a different Google account",
+					correlationOf(r))
+				return
+			}
+			s.databaseOrInternal(w, r, loginErr)
+			return
+		}
+		account = result.Account
+	default:
 		s.databaseOrInternal(w, r, err)
 		return
 	}
@@ -124,7 +158,6 @@ func (s *Server) googleLogin(w http.ResponseWriter, r *http.Request) {
 			correlationOf(r))
 		return
 	}
-	now := s.Now()
 	_ = s.Store.TouchGoogleIdentity(r.Context(), claims.Issuer, claims.Subject, now)
 	_ = s.Store.TouchAccount(r.Context(), account.OwnerID, now)
 	response, err := s.issueSession(r, account, now)
@@ -134,6 +167,37 @@ func (s *Server) googleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	response.GoogleLinked = boolPointer(true)
 	writeJSON(w, http.StatusOK, response)
+}
+
+// googleAccountDigest hashes 32 random bytes, so a Google-only account has no usable password: the
+// input is never known to anyone and password login for that email can never be guessed.
+func googleAccountDigest() (store.PasswordDigest, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return store.PasswordDigest{}, err
+	}
+	digest, err := auth.HashPassword(base64.RawURLEncoding.EncodeToString(raw))
+	if err != nil {
+		return store.PasswordDigest{}, err
+	}
+	return store.PasswordDigest{Salt: digest.Salt, Hash: digest.Hash, KDF: digest.KDF}, nil
+}
+
+// googleDisplayName derives the display name for a provisioned account: the Google profile name
+// trimmed to 80 runes, falling back to the local part of the verified email.
+func googleDisplayName(claims auth.GoogleClaims) string {
+	name := strings.TrimSpace(claims.Name)
+	if runes := []rune(name); len(runes) > 80 {
+		name = string(runes[:80])
+	}
+	if name != "" {
+		return name
+	}
+	local := claims.Email
+	if at := strings.IndexByte(local, '@'); at >= 0 {
+		local = local[:at]
+	}
+	return local
 }
 
 // googleLink binds a verified identity to the authenticated owner. It is an explicit, idempotent

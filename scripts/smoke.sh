@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Minimal Go backend smoke: register -> login -> consent -> category -> transaction -> summary.
-# Requires a running server (default http://127.0.0.1:8080) and the invite code it was started with.
+# Requires a running server (default http://127.0.0.1:8080).
 set -euo pipefail
 BASE="${PAM_BASE_URL:-http://127.0.0.1:8080}"
-INVITE="${PAM_INVITE_CODE:-pam-dev}"
 EMAIL="smoke-$(date +%s)@example.test"
 PASSWORD="synthetic-smoke-password"
 
 json() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
+# Public registration is open (owner decision retired the invite code), so no invite is sent.
 code=$(curl -s -o /tmp/pam-go-register.json -w '%{http_code}' -X POST "$BASE/v1/accounts" \
   -H 'content-type: application/json' \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"displayName\":\"Smoke\",\"inviteCode\":\"$INVITE\"}")
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"displayName\":\"Smoke\"}")
 [[ "$code" == "201" ]] || { echo "register failed: $code"; cat /tmp/pam-go-register.json; exit 1; }
 
 code=$(curl -s -o /tmp/pam-go-login.json -w '%{http_code}' -X POST "$BASE/v1/sessions" \

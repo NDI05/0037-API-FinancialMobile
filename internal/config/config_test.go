@@ -12,10 +12,9 @@ func productionEnv() map[string]string {
 	key := sha256.Sum256([]byte("synthetic-production-data-key"))
 	return map[string]string{
 		"APP_ENV": "production", "DATABASE_URL": "file:./data/prod-test.db",
-		"REGISTRATION_INVITE_CODE": "production-invite",
-		"JWT_SECRET":               "synthetic-production-jwt-secret-32-bytes",
-		"REFRESH_PEPPER":           "synthetic-production-refresh-pepper-32",
-		"DATA_ENCRYPTION_KEY":      base64.StdEncoding.EncodeToString(key[:]),
+		"JWT_SECRET":          "synthetic-production-jwt-secret-32-bytes",
+		"REFRESH_PEPPER":      "synthetic-production-refresh-pepper-32",
+		"DATA_ENCRYPTION_KEY": base64.StdEncoding.EncodeToString(key[:]),
 	}
 }
 
@@ -62,7 +61,6 @@ func TestProductionRejectsDevelopmentAuthConstants(t *testing.T) {
 		{"jwt default", "JWT_SECRET", defaultJWTSecret},
 		{"jwt short", "JWT_SECRET", "short"},
 		{"refresh default", "REFRESH_PEPPER", defaultRefreshPepper},
-		{"invite default", "REGISTRATION_INVITE_CODE", defaultInviteCode},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

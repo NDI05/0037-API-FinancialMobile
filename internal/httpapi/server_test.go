@@ -45,9 +45,8 @@ func newHarnessWithConfig(t *testing.T, provider llm.Provider, extraEnv map[stri
 	path := filepath.Join(t.TempDir(), "pam.db")
 	env := map[string]string{
 		"APP_ENV": "test", "DATABASE_URL": "file:" + path,
-		"REGISTRATION_INVITE_CODE": "pam-test",
-		"JWT_SECRET":               "0123456789abcdef0123456789abcdef",
-		"REFRESH_PEPPER":           "abcdef0123456789abcdef0123456789",
+		"JWT_SECRET":     "0123456789abcdef0123456789abcdef",
+		"REFRESH_PEPPER": "abcdef0123456789abcdef0123456789",
 	}
 	for key, value := range extraEnv {
 		env[key] = value
@@ -120,13 +119,18 @@ func (h *harness) requestWithHeaders(method, path, token string, body any,
 	return response.StatusCode, decoded
 }
 
+// register creates a public password account. Registration is open (no invite code) and always
+// lands as USER, so the helper only asserts the contract every test depends on.
 func (h *harness) register(email string) {
 	h.t.Helper()
 	status, body := h.request("POST", "/v1/accounts", "", map[string]any{
-		"email": email, "password": testPassword, "displayName": "Test", "inviteCode": "pam-test",
+		"email": email, "password": testPassword, "displayName": "Test",
 	})
 	if status != 201 {
 		h.t.Fatalf("register %s: %d %#v", email, status, body)
+	}
+	if body["role"] != "USER" {
+		h.t.Fatalf("register %s role = %v, want USER", email, body["role"])
 	}
 }
 
@@ -318,15 +322,15 @@ func TestAuthAndValidationFailures(t *testing.T) {
 		t.Fatalf("zero amount: %d %#v", status, body)
 	}
 	status, body = h.request("POST", "/v1/accounts", "", map[string]any{
-		"email": "bad", "password": testPassword, "inviteCode": "pam-test",
+		"email": "bad", "password": testPassword,
 	})
 	if status != 400 {
 		t.Fatalf("bad email: %d %#v", status, body)
 	}
 	if status, _ := h.request("POST", "/v1/accounts", "", map[string]any{
-		"email": "x@example.test", "password": testPassword, "inviteCode": "wrong",
-	}); status != 403 {
-		t.Fatalf("wrong invite: %d", status)
+		"email": "x@example.test", "password": "short",
+	}); status != 400 {
+		t.Fatalf("short password: %d", status)
 	}
 }
 
@@ -1475,9 +1479,8 @@ func TestReceiptTokenIsNeverWrittenToLogs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "log.db")
 	cfg, err := config.Load(map[string]string{
 		"APP_ENV": "test", "DATABASE_URL": "file:" + path,
-		"REGISTRATION_INVITE_CODE": "pam-test",
-		"JWT_SECRET":               "0123456789abcdef0123456789abcdef",
-		"REFRESH_PEPPER":           "abcdef0123456789abcdef0123456789",
+		"JWT_SECRET":     "0123456789abcdef0123456789abcdef",
+		"REFRESH_PEPPER": "abcdef0123456789abcdef0123456789",
 	})
 	if err != nil {
 		t.Fatal(err)

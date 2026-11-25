@@ -130,9 +130,14 @@ func (s *Store) insertAccountTx(ctx context.Context, tx *sql.Tx, email, displayN
 	return ownerID, nil
 }
 
+// accountSelectColumns is the canonical account projection. Centralising it keeps FindAccountBy*
+// and the transactional Google SSO reads byte-identical so an account looks the same regardless of
+// which path loaded it.
+const accountSelectColumns = `owner_id, email, display_name, salt, password_hash, kdf,
+	role, status, auth_version, revision, created_at`
+
 func (s *Store) FindAccountByEmail(ctx context.Context, email string) (Account, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT owner_id, email, display_name, salt, password_hash, kdf,
-		role, status, auth_version, revision, created_at
+	row := s.DB.QueryRowContext(ctx, `SELECT `+accountSelectColumns+`
 		FROM users WHERE email = ?`, NormalizeEmail(email))
 	return scanAccount(row)
 }
@@ -140,8 +145,7 @@ func (s *Store) FindAccountByEmail(ctx context.Context, email string) (Account, 
 // FindAccountByOwner loads the full account row for a face already known by owner (SSO login).
 // It returns the same fields as FindAccountByEmail, including role/auth_version for issueSession.
 func (s *Store) FindAccountByOwner(ctx context.Context, ownerID string) (Account, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT owner_id, email, display_name, salt, password_hash, kdf,
-		role, status, auth_version, revision, created_at
+	row := s.DB.QueryRowContext(ctx, `SELECT `+accountSelectColumns+`
 		FROM users WHERE owner_id = ?`, ownerID)
 	return scanAccount(row)
 }

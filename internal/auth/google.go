@@ -33,12 +33,15 @@ const (
 )
 
 // GoogleClaims are the subset of an ID token the backend consumes. Email is only filled when
-// email_verified=true; it is never used to find an owner (the link table is).
+// email_verified=true, because only a verified address may auto-link or auto-provision an account;
+// after the first link the (issuer, subject) row is the authoritative identity, so a later email
+// change on the Google side cannot move a login to a different owner.
 type GoogleClaims struct {
 	Issuer        string
 	Subject       string
 	Email         string
 	EmailVerified bool
+	Name          string
 	Nonce         string
 	ExpiresAt     time.Time
 	IssuedAt      time.Time
@@ -125,6 +128,7 @@ func (v *GoogleVerifier) Verify(ctx context.Context, idToken, expectedNonce stri
 		Sub           string          `json:"sub"`
 		Email         string          `json:"email"`
 		EmailVerified bool            `json:"email_verified"`
+		Name          string          `json:"name"`
 		Nonce         string          `json:"nonce"`
 		Exp           int64           `json:"exp"`
 		Iat           int64           `json:"iat"`
@@ -154,8 +158,8 @@ func (v *GoogleVerifier) Verify(ctx context.Context, idToken, expectedNonce stri
 		return GoogleClaims{}, invalid("issued in the future")
 	}
 	claims := GoogleClaims{Issuer: payload.Iss, Subject: payload.Sub, Nonce: payload.Nonce,
-		EmailVerified: payload.EmailVerified,
-		ExpiresAt:     time.Unix(payload.Exp, 0).UTC()}
+		EmailVerified: payload.EmailVerified, Name: strings.TrimSpace(payload.Name),
+		ExpiresAt: time.Unix(payload.Exp, 0).UTC()}
 	if payload.Iat != 0 {
 		claims.IssuedAt = time.Unix(payload.Iat, 0).UTC()
 	}

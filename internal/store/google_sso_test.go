@@ -293,3 +293,158 @@ func TestConcurrentGoogleLinkSameOwnerDifferentSubjects(t *testing.T) {
 		t.Fatalf("third identity link error = %v, want ErrGoogleAlreadyLinked", err)
 	}
 }
+
+// TestFindOrCreateAccountForGoogleProvisionsThenReuses covers the direct-SSO store contract: the
+// first login provisions one USER account with its link, and every later login reuses it.
+func TestFindOrCreateAccountForGoogleProvisionsThenReuses(t *testing.T) {
+	store, ctx := newSSOStore(t)
+	now := time.Now().UTC()
+	digest := PasswordDigest{Salt: []byte("salt"), Hash: []byte("hash"), KDF: "scrypt:N=32768,r=8,p=1"}
+	issuer, subject, email := "https://accounts.google.com", "sub-new", "new@example.test"
+
+	first, err := store.FindOrCreateAccountForGoogle(ctx, issuer, subject, email, "New Person",
+		digest, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Created {
+		t.Fatal("first login did not report Created")
+	}
+	if first.Account.Email != email || first.Account.Role != "USER" ||
+		first.Account.DisplayName != "New Person" {
+		t.Fatalf("provisioned account = %#v", first.Account)
+	}
+	identity, err := store.FindGoogleIdentity(ctx, issuer, subject)
+	if err != nil || identity.OwnerID != first.Account.OwnerID {
+		t.Fatalf("provisioned identity = %#v err=%v", identity, err)
+	}
+
+	// The same identity (even with case/space noise in the claim email) reuses the account.
+	second, err := store.FindOrCreateAccountForGoogle(ctx, issuer, subject, " New@Example.TEST ",
+		"", digest, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Created || second.Account.OwnerID != first.Account.OwnerID {
+		t.Fatalf("second login = %#v, want reuse of %s", second, first.Account.OwnerID)
+	}
+	var users, identities int
+	if err := store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM google_identities`).
+		Scan(&identities); err != nil {
+		t.Fatal(err)
+	}
+	if users != 1 || identities != 1 {
+		t.Fatalf("users=%d identities=%d, want 1 and 1", users, identities)
+	}
+}
+
+// TestFindOrCreateAccountForGoogleAutoLinksEmailAccount proves that a verified email owned by an
+// existing password account links that account instead of creating a second one.
+func TestFindOrCreateAccountForGoogleAutoLinksEmailAccount(t *testing.T) {
+	store, ctx := newSSOStore(t)
+	now := time.Now().UTC()
+	digest := PasswordDigest{Salt: []byte("salt"), Hash: []byte("hash"), KDF: "scrypt:N=32768,r=8,p=1"}
+	account, err := store.CreateAccount(ctx, "existing@example.test", "Existing", digest, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.FindOrCreateAccountForGoogle(ctx, "https://accounts.google.com",
+		"sub-existing", "existing@example.test", "Existing Person", digest, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created || result.Account.OwnerID != account.OwnerID {
+		t.Fatalf("auto-link result = %#v, want existing owner %s", result, account.OwnerID)
+	}
+	identity, err := store.FindGoogleIdentity(ctx, "https://accounts.google.com", "sub-existing")
+	if err != nil || identity.OwnerID != account.OwnerID {
+		t.Fatalf("auto-link identity = %#v err=%v", identity, err)
+	}
+}
+
+// TestFindOrCreateAccountForGoogleRejectsConflictingIdentity: an account that already has a Google
+// link is never re-pointed to a different identity, and nothing is written.
+func TestFindOrCreateAccountForGoogleRejectsConflictingIdentity(t *testing.T) {
+	store, ctx := newSSOStore(t)
+	now := time.Now().UTC()
+	digest := PasswordDigest{Salt: []byte("salt"), Hash: []byte("hash"), KDF: "scrypt:N=32768,r=8,p=1"}
+	account, err := store.CreateAccount(ctx, "linked@example.test", "Linked", digest, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LinkGoogleIdentity(ctx, account.OwnerID, "https://accounts.google.com",
+		"first-sub", "linked@example.test", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FindOrCreateAccountForGoogle(ctx, "https://accounts.google.com",
+		"second-sub", "linked@example.test", "Linked", digest, now); !errors.Is(err,
+		ErrGoogleIdentityConflict) {
+		t.Fatalf("conflicting identity error = %v, want ErrGoogleIdentityConflict", err)
+	}
+	var count int
+	if err := store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM google_identities
+		WHERE owner_id = ?`, account.OwnerID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("identity rows = %d, want 1", count)
+	}
+	if _, err := store.FindGoogleIdentity(ctx, "https://accounts.google.com",
+		"second-sub"); !errors.Is(err, ErrGoogleIdentityNotLinked) {
+		t.Fatalf("conflicting identity was stored: %v", err)
+	}
+}
+
+// TestFindOrCreateAccountForGoogleConcurrentSameIdentity: two simultaneous first logins must settle
+// on one account and one link, never a duplicate or an orphaned account.
+func TestFindOrCreateAccountForGoogleConcurrentSameIdentity(t *testing.T) {
+	store, ctx := newSSOStore(t)
+	now := time.Now().UTC()
+	digest := PasswordDigest{Salt: []byte("salt"), Hash: []byte("hash"), KDF: "scrypt:N=32768,r=8,p=1"}
+	start := make(chan struct{})
+	results := make([]GoogleLoginResult, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for index := range results {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			results[index], errs[index] = store.FindOrCreateAccountForGoogle(ctx,
+				"https://accounts.google.com", "race-sso-sub", "race@example.test", "Race", digest, now)
+		}(index)
+	}
+	close(start)
+	wg.Wait()
+	for index, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent login %d = %v", index, err)
+		}
+	}
+	if results[0].Account.OwnerID != results[1].Account.OwnerID {
+		t.Fatalf("concurrent logins resolved different owners: %#v", results)
+	}
+	created := 0
+	for _, result := range results {
+		if result.Created {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("Created count = %d, want exactly 1", created)
+	}
+	var users, identities int
+	if err := store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM google_identities`).
+		Scan(&identities); err != nil {
+		t.Fatal(err)
+	}
+	if users != 1 || identities != 1 {
+		t.Fatalf("users=%d identities=%d, want 1 and 1", users, identities)
+	}
+}

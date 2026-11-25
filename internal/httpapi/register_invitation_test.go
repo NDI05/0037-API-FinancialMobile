@@ -2,103 +2,75 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 )
 
-// P2-3 regression: the legacy invitationToken acceptance path is still supported, but only after the
-// production inviteCode gate passes. The role always comes from the one-time invitation, never from
-// the request body, and invalid/expired/consumed tokens do not create accounts.
-func TestInvitationTokenAcceptanceRegression(t *testing.T) {
+// CR-009 owner decision: invite-gated registration is retired. Public registration is open for any
+// valid email+password and always creates a plain USER account, so no invite code is sent at all.
+func TestPublicRegistrationNeedsNoInviteCode(t *testing.T) {
+	h := newHarness(t)
+	status, body := h.request("POST", "/v1/accounts", "", map[string]any{
+		"email": "open@example.test", "password": testPassword, "displayName": "Open",
+	})
+	if status != 201 {
+		t.Fatalf("register without invite code: %d %#v", status, body)
+	}
+	if body["role"] != "USER" {
+		t.Fatalf("role = %v, want USER", body["role"])
+	}
+	access, _ := h.login("open@example.test")
+	status, me := h.request("GET", "/v1/me", access, nil)
+	if status != 200 || me["role"] != "USER" || me["googleLinked"] != false {
+		t.Fatalf("session after open registration: %d %#v", status, me)
+	}
+}
+
+// The retired invite fields are gone from the public registration contract entirely, so the strict
+// JSON decoder rejects them: a leaked admin invitation token cannot be redeemed through public
+// registration and the one-time invitation stays unconsumed.
+func TestPublicRegistrationRejectsRetiredInviteFields(t *testing.T) {
 	h := newHarness(t)
 	h.register("inviter@example.test")
 	actor := h.ownerIDOf("inviter@example.test")
 	ctx := context.Background()
 	now := time.Now()
-	inviteCode := "pam-test"
-
-	register := func(email, display, code, token string) (int, map[string]any) {
-		body := map[string]any{"email": email, "password": testPassword, "displayName": display}
-		if code != "" {
-			body["inviteCode"] = code
+	invitation, adminToken, err := h.store.CreateAdminInvitation(ctx, actor,
+		"invited-admin@example.test", "ADMIN", 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, extra := range map[string]map[string]any{
+		"invite code":      {"inviteCode": "pam-test"},
+		"invitation token": {"invitationToken": adminToken},
+	} {
+		body := map[string]any{
+			"email": "invited-admin@example.test", "password": testPassword, "displayName": "Undangan",
 		}
-		if token != "" {
-			body["invitationToken"] = token
+		for key, value := range extra {
+			body[key] = value
 		}
-		return h.request("POST", "/v1/accounts", "", body)
+		status, response := h.request("POST", "/v1/accounts", "", body)
+		if status != 400 || response["code"] != "invalid_request" {
+			t.Fatalf("%s: %d %#v, want 400 invalid_request", name, status, response)
+		}
 	}
-
-	// The invite-code gate is evaluated before the invitation branch: a wrong code must not consume
-	// the one-time token.
-	_, adminToken, err := h.store.CreateAdminInvitation(ctx, actor, "invited-admin@example.test",
-		"ADMIN", 2*time.Hour, now)
-	if err != nil {
+	var accountCount int
+	if err := h.store.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM users WHERE email = ?`, "invited-admin@example.test").
+		Scan(&accountCount); err != nil {
 		t.Fatal(err)
 	}
-	if status, body := register("invited-admin@example.test", "Undangan Satu", "wrong", adminToken); status != 403 ||
-		body["message"] != "invalid_invite" {
-		t.Fatalf("wrong invite code with token: %d %#v", status, body)
+	if accountCount != 0 {
+		t.Fatalf("retired invite fields still created %d accounts", accountCount)
 	}
-	status, accepted := register("invited-admin@example.test", "Undangan Satu", inviteCode, adminToken)
-	if status != 201 || accepted["role"] != "ADMIN" {
-		t.Fatalf("valid invitation acceptance: %d %#v", status, accepted)
-	}
-	invitedOwner := h.ownerIDOf("invited-admin@example.test")
-	if invitedOwner == actor {
-		t.Fatal("invited account reused the inviter owner")
-	}
-	// Owner isolation: a fresh invited owner sees an empty ledger, not the inviter's data.
-	invitedAccess, _ := h.login("invited-admin@example.test")
-	if status, list := h.request("GET", "/v1/transactions?month=2026-11", invitedAccess, nil); status != 200 ||
-		len(list["items"].([]any)) != 0 {
-		t.Fatalf("invited owner leaked transactions: %d %#v", status, list)
-	}
-
-	// A consumed token is rejected even for the same invited email.
-	if status, body := register("invited-admin@example.test", "Undangan Satu", inviteCode, adminToken); status != 409 ||
-		body["code"] != "invitation_used" {
-		t.Fatalf("reused invitation: %d %#v", status, body)
-	}
-
-	// Invalid, mismatched and expired tokens never create an account.
-	if status, body := register("bad-token@example.test", "Bad", inviteCode, "not-a-real-token"); status != 400 ||
-		body["code"] != "invalid_invitation" {
-		t.Fatalf("invalid token: %d %#v", status, body)
-	}
-	_, boundToken, err := h.store.CreateAdminInvitation(ctx, actor, "token-bound@example.test",
-		"USER", 2*time.Hour, now)
-	if err != nil {
+	var usedAt sql.NullString
+	if err := h.store.DB.QueryRowContext(ctx, `SELECT used_at FROM admin_invitations
+		WHERE id = ?`, invitation.ID).Scan(&usedAt); err != nil {
 		t.Fatal(err)
 	}
-	if status, body := register("other-email@example.test", "Other", inviteCode, boundToken); status != 400 ||
-		body["code"] != "invalid_invitation" {
-		t.Fatalf("token bound to another email: %d %#v", status, body)
-	}
-	_, expiredToken, err := h.store.CreateAdminInvitation(ctx, actor, "expired-invite@example.test",
-		"USER", 2*time.Hour, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.store.DB.ExecContext(ctx, `UPDATE admin_invitations SET expires_at=? WHERE email=?`,
-		now.Add(-2*time.Hour).UTC().Format(time.RFC3339Nano), "expired-invite@example.test"); err != nil {
-		t.Fatal(err)
-	}
-	if status, body := register("expired-invite@example.test", "Expired", inviteCode, expiredToken); status != 410 ||
-		body["code"] != "invitation_expired" {
-		t.Fatalf("expired token: %d %#v", status, body)
-	}
-	// A token without the production invite code is still rejected.
-	_, noCodeToken, err := h.store.CreateAdminInvitation(ctx, actor, "no-code@example.test",
-		"USER", 2*time.Hour, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status, body := register("no-code@example.test", "NoCode", "", noCodeToken); status != 403 ||
-		body["message"] != "invalid_invite" {
-		t.Fatalf("token without invite code: %d %#v", status, body)
-	}
-	if status, body := register("expired-invite@example.test", "Expired Again", inviteCode, expiredToken); status != 403 &&
-		status != 410 {
-		t.Fatalf("rejected token unexpectedly accepted: %d %#v", status, body)
+	if usedAt.Valid {
+		t.Fatalf("public registration consumed an admin invitation: %v", usedAt.String)
 	}
 }

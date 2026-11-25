@@ -14,12 +14,13 @@ import (
 	"github.com/pam/recap/backend-go/internal/store"
 )
 
+// registerRequest is the public password registration body. There is no invite code or admin
+// invitation token: the owner decision retired invite-gated registration, so every public
+// account is created as a plain USER by the store.
 type registerRequest struct {
-	Email           string `json:"email"`
-	Password        string `json:"password"`
-	DisplayName     string `json:"displayName"`
-	InviteCode      string `json:"inviteCode"`
-	InvitationToken string `json:"invitationToken"`
+	Email       string `json:"email"`
+	Password    string `json:"password"`
+	DisplayName string `json:"displayName"`
 }
 
 type sessionResponse struct {
@@ -56,10 +57,6 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "password must be 8..200 characters", correlationOf(r))
 		return
 	}
-	if !secureEqual(body.InviteCode, s.Config.InviteCode) {
-		writeError(w, http.StatusForbidden, "forbidden", "invalid_invite", correlationOf(r))
-		return
-	}
 	display := strings.TrimSpace(body.DisplayName)
 	if len([]rune(display)) > 80 {
 		writeError(w, http.StatusBadRequest, "invalid_request", "displayName is too long", correlationOf(r))
@@ -70,24 +67,13 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Unexpected error", correlationOf(r))
 		return
 	}
-	var account store.Account
 	digestValue := store.PasswordDigest{Salt: digest.Salt, Hash: digest.Hash, KDF: digest.KDF}
-	if body.InvitationToken != "" {
-		// Controlled admin provisioning: the role comes from the one-time invitation, never from
-		// the request body. A public registration without a token always lands as USER.
-		account, err = s.Store.CreateAccountFromInvitation(r.Context(), body.InvitationToken,
-			email, display, digestValue, s.Now())
-	} else {
-		account, err = s.Store.CreateAccount(r.Context(), email, display, digestValue, s.Now())
-	}
+	// Public registration is open and always creates a USER account. The role is never taken from
+	// the request, so a crafted body cannot self-assign ADMIN.
+	account, err := s.Store.CreateAccount(r.Context(), email, display, digestValue, s.Now())
 	if err != nil {
 		if errors.Is(err, store.ErrEmailExists) {
 			writeError(w, http.StatusConflict, "conflict", "Email is already registered", correlationOf(r))
-			return
-		}
-		if errors.Is(err, store.ErrInvitationUsed) || errors.Is(err, store.ErrInvitationExpired) ||
-			errors.Is(err, store.ErrInvitationInvalid) {
-			s.mapWriteError(w, r, err)
 			return
 		}
 		s.databaseOrInternal(w, r, err)

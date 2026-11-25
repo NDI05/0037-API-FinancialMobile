@@ -22,7 +22,6 @@ const (
 	DefaultAccessTTL      = 15 * time.Minute
 	DefaultRefreshTTLDays = 30
 	DefaultDataKeyVersion = 1
-	defaultInviteCode     = "pam-dev"
 	defaultJWTSecret      = "dev-jwt-secret-not-for-production-use-32b"
 	defaultRefreshPepper  = "dev-refresh-pepper-not-for-production-use"
 	defaultDatabaseURL    = "file:./data/pam.db"
@@ -34,7 +33,6 @@ type Config struct {
 	Port               int
 	LogLevel           string
 	Database           Database
-	InviteCode         string
 	InternalSweepToken string
 	JWT                JWT
 	DataKey            []byte
@@ -194,7 +192,6 @@ func Load(env map[string]string) (*Config, error) {
 	cfg := &Config{
 		Env:                get(env, "APP_ENV", get(env, "NODE_ENV", "development")),
 		LogLevel:           get(env, "LOG_LEVEL", "info"),
-		InviteCode:         get(env, "REGISTRATION_INVITE_CODE", ""),
 		InternalSweepToken: get(env, "INTERNAL_SWEEP_TOKEN", ""),
 		Database: Database{
 			URL:       normalizeDatabaseURL(get(env, "DATABASE_URL", defaultDatabaseURL)),
@@ -423,9 +420,6 @@ func Load(env map[string]string) (*Config, error) {
 	}
 	if cfg.Env == "production" {
 		problems := []string{}
-		if cfg.InviteCode == "" || cfg.InviteCode == defaultInviteCode {
-			problems = append(problems, "REGISTRATION_INVITE_CODE must be set to a non-development value")
-		}
 		if len(rawJWT) < 32 || rawJWT == defaultJWTSecret {
 			problems = append(problems, "JWT_SECRET must be at least 32 bytes and not the development value")
 		}
@@ -443,10 +437,6 @@ func Load(env map[string]string) (*Config, error) {
 		if len(problems) > 0 {
 			return nil, fmt.Errorf("invalid production configuration: %s", strings.Join(problems, "; "))
 		}
-	}
-	if cfg.InviteCode == "" {
-		cfg.InviteCode = defaultInviteCode
-		cfg.Warnings = append(cfg.Warnings, "REGISTRATION_INVITE_CODE missing: using the development invite code")
 	}
 	if cfg.Env != "production" {
 		cfg.Warnings = append(cfg.Warnings, "development secrets are in use; do not run this configuration in production")

@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// ErrGoogleIdentityNotLinked means the verified Google identity is not linked to any account. SSO
-// never creates accounts: an unknown identity is a client error, not an invitation to register.
+// ErrGoogleIdentityNotLinked means the verified Google identity is not linked to any account yet.
+// Direct SSO resolves it by auto-linking to the account that owns the same verified email or by
+// provisioning a new USER account; the explicit /link route reports it as an unknown identity.
 var ErrGoogleIdentityNotLinked = errors.New("google identity is not linked")
 
 // ErrGoogleIdentityConflict means (issuer, subject) is already linked to another owner.
@@ -181,4 +182,143 @@ func (s *Store) GoogleLinked(ctx context.Context, ownerID string) (bool, error) 
 		return false, err
 	}
 	return exists == 1, nil
+}
+
+// GoogleLoginResult is the outcome of a direct Google SSO login. Created reports that this login
+// provisioned a brand-new USER account.
+type GoogleLoginResult struct {
+	Account Account
+	Created bool
+}
+
+// FindOrCreateAccountForGoogle resolves a verified Google identity to its PAM account. When the
+// identity is already linked the linked account is returned unchanged. Otherwise the identity is
+// linked to the account that owns the same verified email, or a fresh USER account is provisioned
+// when no account owns the email. The write paths are transactional so an account never exists
+// without its identity, and the caller must pass the verified email (never a raw claim).
+//
+// The email owner is the only auto-link target. A PAM account that already has a different Google
+// identity is a conflict, so a same-email Google login can never re-point an existing link.
+// Concurrent first logins are resolved by re-reading after a unique violation: the winner's row is
+// reused, so a Google identity can never create two accounts and a race can never mint an orphan.
+func (s *Store) FindOrCreateAccountForGoogle(ctx context.Context, issuer, subject, email,
+	displayName string, digest PasswordDigest, now time.Time) (GoogleLoginResult, error) {
+	issuer = strings.TrimSpace(issuer)
+	subject = strings.TrimSpace(subject)
+	email = NormalizeEmail(email)
+	displayName = strings.TrimSpace(displayName)
+	if issuer == "" || subject == "" || email == "" {
+		return GoogleLoginResult{}, errors.New("google issuer, subject and verified email are required")
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		result, err := s.findOrCreateGoogleAccountTx(ctx, issuer, subject, email, displayName,
+			digest, now)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !isUnique(err.Error()) && !errors.Is(err, ErrEmailExists) {
+			return GoogleLoginResult{}, err
+		}
+		// Another writer won a unique constraint. If our identity is linked now, its account is the
+		// answer; if only the email appeared, the next attempt links to it instead of re-inserting.
+		identity, findErr := s.FindGoogleIdentity(ctx, issuer, subject)
+		if findErr == nil {
+			account, err := s.FindAccountByOwner(ctx, identity.OwnerID)
+			if err != nil {
+				return GoogleLoginResult{}, err
+			}
+			return GoogleLoginResult{Account: account}, nil
+		}
+		if !errors.Is(findErr, ErrGoogleIdentityNotLinked) {
+			return GoogleLoginResult{}, findErr
+		}
+		if _, emailErr := s.FindAccountByEmail(ctx, email); emailErr != nil &&
+			!errors.Is(emailErr, ErrNotFound) {
+			return GoogleLoginResult{}, emailErr
+		}
+	}
+	return GoogleLoginResult{}, lastErr
+}
+
+// findOrCreateGoogleAccountTx is one transactional attempt of FindOrCreateAccountForGoogle.
+// Unique violations are returned raw (except the account INSERT, which maps its own) so the caller
+// can classify the race and retry from committed state.
+func (s *Store) findOrCreateGoogleAccountTx(ctx context.Context, issuer, subject, email,
+	displayName string, digest PasswordDigest, now time.Time) (GoogleLoginResult, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return GoogleLoginResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var ownerID string
+	err = tx.QueryRowContext(ctx, `SELECT owner_id FROM google_identities
+		WHERE issuer = ? AND subject = ?`, issuer, subject).Scan(&ownerID)
+	switch {
+	case err == nil:
+		account, err := scanAccount(tx.QueryRowContext(ctx,
+			`SELECT `+accountSelectColumns+` FROM users WHERE owner_id = ?`, ownerID))
+		if err != nil {
+			return GoogleLoginResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return GoogleLoginResult{}, err
+		}
+		return GoogleLoginResult{Account: account}, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return GoogleLoginResult{}, err
+	}
+
+	account, err := scanAccount(tx.QueryRowContext(ctx,
+		`SELECT `+accountSelectColumns+` FROM users WHERE email = ?`, email))
+	switch {
+	case err == nil:
+		var linkedIssuer, linkedSubject string
+		err = tx.QueryRowContext(ctx, `SELECT issuer, subject FROM google_identities
+			WHERE owner_id = ?`, account.OwnerID).Scan(&linkedIssuer, &linkedSubject)
+		if err == nil {
+			return GoogleLoginResult{}, ErrGoogleIdentityConflict
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return GoogleLoginResult{}, err
+		}
+		// An inactive account must not gain a link from a login the handler will refuse anyway.
+		if account.Status != "ACTIVE" {
+			return GoogleLoginResult{Account: account}, nil
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO google_identities
+			(issuer, subject, owner_id, email, created_at, last_login_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			issuer, subject, account.OwnerID, email, nowString(now), nowString(now)); err != nil {
+			return GoogleLoginResult{}, err
+		}
+	case errors.Is(err, ErrNotFound):
+		ownerID, err := s.insertAccountTx(ctx, tx, email, displayName, digest, "USER", now)
+		if err != nil {
+			return GoogleLoginResult{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO google_identities
+			(issuer, subject, owner_id, email, created_at, last_login_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			issuer, subject, ownerID, email, nowString(now), nowString(now)); err != nil {
+			return GoogleLoginResult{}, err
+		}
+		account, err = scanAccount(tx.QueryRowContext(ctx,
+			`SELECT `+accountSelectColumns+` FROM users WHERE owner_id = ?`, ownerID))
+		if err != nil {
+			return GoogleLoginResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return GoogleLoginResult{}, err
+		}
+		return GoogleLoginResult{Account: account, Created: true}, nil
+	default:
+		return GoogleLoginResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GoogleLoginResult{}, err
+	}
+	return GoogleLoginResult{Account: account}, nil
 }

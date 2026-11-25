@@ -137,14 +137,15 @@ func TestGoogleSSOLoginRejectsBadTokensAndNonces(t *testing.T) {
 	h.register("owner@example.test")
 	before := h.userCount(t)
 
-	// A valid token for an unlinked identity must not create an account.
+	// A token that fails verification never provisions an account, even though a verified token for
+	// an unknown identity now does (direct registration).
 	nonce := h.nonce(t)
-	if status, body := h.googleLogin(t, h.tokenFor(t, "unlinked-sub", nonce, nil),
-		nonce); status != 409 || body["code"] != "google_identity_not_linked" {
-		t.Fatalf("unlinked login = %d %#v", status, body)
+	if status, body := h.googleLogin(t, h.tokenFor(t, "unlinked-sub", nonce, nil)+"x",
+		nonce); status != 401 || body["code"] != "google_invalid_token" {
+		t.Fatalf("bad signature login = %d %#v", status, body)
 	}
 	if after := h.userCount(t); after != before {
-		t.Fatalf("unlinked login created a user: %d -> %d", before, after)
+		t.Fatalf("failed login created a user: %d -> %d", before, after)
 	}
 
 	cases := []struct {
@@ -505,5 +506,189 @@ func TestGoogleSSOSameEmailDifferentSubjectsDoNotMerge(t *testing.T) {
 		if user["ownerId"] != wantOwner {
 			t.Fatalf("%s owner = %v, want %s", subject, user["ownerId"], wantOwner)
 		}
+	}
+}
+
+// TestGoogleSSODirectRegistrationProvisionsUser is the owner-decision path: a verified Google
+// identity that is not linked and whose email no account owns logs in AND provisions a new USER
+// account, so Google can be used for direct registration without pre-linking in Settings.
+func TestGoogleSSODirectRegistrationProvisionsUser(t *testing.T) {
+	h := newGoogleHarness(t)
+	before := h.userCount(t)
+	nonce := h.nonce(t)
+	status, session := h.googleLogin(t, h.tokenFor(t, "new-sub", nonce, nil), nonce)
+	if status != 200 || session["googleLinked"] != true || session["accessToken"] == nil {
+		t.Fatalf("direct registration = %d %#v", status, session)
+	}
+	user := session["user"].(map[string]any)
+	if user["role"] != "USER" {
+		t.Fatalf("provisioned role = %v, want USER", user["role"])
+	}
+	owner := store.OwnerIDForEmail("new-sub@example.test")
+	if user["ownerId"] != owner {
+		t.Fatalf("provisioned owner = %v, want %s", user["ownerId"], owner)
+	}
+	if after := h.userCount(t); after != before+1 {
+		t.Fatalf("accounts = %d, want %d", after, before+1)
+	}
+	if rows := h.countRows(t, "google_identities", owner); rows != 1 {
+		t.Fatalf("identity rows = %d, want 1", rows)
+	}
+	// The session is a full PAM session and /v1/me reports the link.
+	status, me := h.request("GET", "/v1/me", session["accessToken"].(string), nil)
+	if status != 200 || me["googleLinked"] != true || me["role"] != "USER" {
+		t.Fatalf("provisioned me = %d %#v", status, me)
+	}
+	// A Google-only account has no usable password: the digest is random and unknown.
+	if status, _ := h.request("POST", "/v1/sessions", "", map[string]any{
+		"email": "new-sub@example.test", "password": testPassword}); status != 401 {
+		t.Fatalf("password login for google-only account = %d, want 401", status)
+	}
+}
+
+// A verified Google login whose email matches an existing password account auto-links that account
+// instead of creating a duplicate, and the original password login keeps working.
+func TestGoogleSSODirectLoginLinksExistingEmailAccount(t *testing.T) {
+	h := newGoogleHarness(t)
+	h.register("existing@example.test")
+	owner := store.OwnerIDForEmail("existing@example.test")
+	before := h.userCount(t)
+
+	nonce := h.nonce(t)
+	status, session := h.googleLogin(t, h.tokenFor(t, "existing-google-sub", nonce,
+		func(claims map[string]any) { claims["email"] = "existing@example.test" }), nonce)
+	if status != 200 || session["googleLinked"] != true {
+		t.Fatalf("auto-link login = %d %#v", status, session)
+	}
+	user := session["user"].(map[string]any)
+	if user["ownerId"] != owner || user["role"] != "USER" {
+		t.Fatalf("auto-link user = %#v, want owner %s role USER", user, owner)
+	}
+	if after := h.userCount(t); after != before {
+		t.Fatalf("auto-link created a duplicate account: %d -> %d", before, after)
+	}
+	identity, err := h.store.FindGoogleIdentity(context.Background(),
+		"https://accounts.google.com", "existing-google-sub")
+	if err != nil || identity.OwnerID != owner {
+		t.Fatalf("auto-linked identity = %#v %v", identity, err)
+	}
+	// The link is additive: the password credential still works.
+	if access, _ := h.login("existing@example.test"); access == "" {
+		t.Fatal("password login broke after auto-link")
+	}
+}
+
+// An unverified Google email is not proof of ownership: it must not create an account and must not
+// attach a Google identity to the account that owns the address.
+func TestGoogleSSODirectLoginRejectsUnverifiedEmail(t *testing.T) {
+	h := newGoogleHarness(t)
+	nonce := h.nonce(t)
+	status, body := h.googleLogin(t, h.tokenFor(t, "unverified-sub", nonce,
+		func(claims map[string]any) { claims["email_verified"] = false }), nonce)
+	if status != 403 || body["code"] != "google_email_unverified" {
+		t.Fatalf("unverified login = %d %#v", status, body)
+	}
+	if count := h.userCount(t); count != 0 {
+		t.Fatalf("unverified login created %d accounts", count)
+	}
+
+	// A known email with an unverified claim is refused without touching the account's links.
+	h.register("victim@example.test")
+	victimOwner := store.OwnerIDForEmail("victim@example.test")
+	nonce = h.nonce(t)
+	status, body = h.googleLogin(t, h.tokenFor(t, "victim-sub", nonce, func(claims map[string]any) {
+		claims["email"] = "victim@example.test"
+		claims["email_verified"] = false
+	}), nonce)
+	if status != 403 || body["code"] != "google_email_unverified" {
+		t.Fatalf("unverified known email = %d %#v", status, body)
+	}
+	if rows := h.countRows(t, "google_identities", victimOwner); rows != 0 {
+		t.Fatalf("unverified email attached %d identities", rows)
+	}
+}
+
+// Logging in twice with the same Google identity is idempotent: one account, one link, two sessions.
+func TestGoogleSSODirectLoginSameIdentityTwiceIsIdempotent(t *testing.T) {
+	h := newGoogleHarness(t)
+	nonce := h.nonce(t)
+	status, first := h.googleLogin(t, h.tokenFor(t, "twice-sub", nonce, nil), nonce)
+	if status != 200 {
+		t.Fatalf("first login = %d %#v", status, first)
+	}
+	nonce = h.nonce(t)
+	status, second := h.googleLogin(t, h.tokenFor(t, "twice-sub", nonce, nil), nonce)
+	if status != 200 {
+		t.Fatalf("second login = %d %#v", status, second)
+	}
+	if first["user"].(map[string]any)["ownerId"] != second["user"].(map[string]any)["ownerId"] {
+		t.Fatalf("second login resolved a different owner: %#v vs %#v", first["user"], second["user"])
+	}
+	if count := h.userCount(t); count != 1 {
+		t.Fatalf("accounts = %d, want 1", count)
+	}
+	if rows := h.countRows(t, "google_identities", store.OwnerIDForEmail("twice-sub@example.test")); rows != 1 {
+		t.Fatalf("identity rows = %d, want 1", rows)
+	}
+}
+
+// A verified Google email that already belongs to a PAM account linked to a DIFFERENT Google identity
+// is a conflict: the existing link is never re-pointed and no second account is created.
+func TestGoogleSSODirectLoginConflictingIdentityIsForbidden(t *testing.T) {
+	h := newGoogleHarness(t)
+	h.register("alice@example.test")
+	access, _ := h.login("alice@example.test")
+	aliceOwner := store.OwnerIDForEmail("alice@example.test")
+	before := h.userCount(t)
+
+	nonce := h.nonce(t)
+	if status, body := h.link(t, access, h.tokenFor(t, "alice-google-sub", nonce, nil), nonce); status != 200 {
+		t.Fatalf("alice link = %d %#v", status, body)
+	}
+	// Same verified email, different Google subject: the account already has an identity.
+	nonce = h.nonce(t)
+	status, body := h.googleLogin(t, h.tokenFor(t, "attacker-sub", nonce, func(claims map[string]any) {
+		claims["email"] = "alice@example.test"
+	}), nonce)
+	if status != 409 || body["code"] != "google_identity_conflict" {
+		t.Fatalf("conflicting login = %d %#v", status, body)
+	}
+	if after := h.userCount(t); after != before {
+		t.Fatalf("conflict created an account: %d -> %d", before, after)
+	}
+	if rows := h.countRows(t, "google_identities", aliceOwner); rows != 1 {
+		t.Fatalf("alice identity rows = %d, want 1", rows)
+	}
+	// Alice's linked identity still logs her in and the attacker identity remains unlinked.
+	nonce = h.nonce(t)
+	status, session := h.googleLogin(t, h.tokenFor(t, "alice-google-sub", nonce, nil), nonce)
+	if status != 200 || session["user"].(map[string]any)["ownerId"] != aliceOwner {
+		t.Fatalf("alice login after conflict = %d %#v", status, session)
+	}
+	if _, err := h.store.FindGoogleIdentity(context.Background(),
+		"https://accounts.google.com", "attacker-sub"); !errors.Is(err, store.ErrGoogleIdentityNotLinked) {
+		t.Fatalf("attacker identity err = %v, want not linked", err)
+	}
+}
+
+// Auto-provisioning never links or logs in through an inactive account: the login is refused before
+// any identity is written.
+func TestGoogleSSODirectLoginInactiveEmailAccountIsForbidden(t *testing.T) {
+	h := newGoogleHarness(t)
+	h.register("suspended@example.test")
+	owner := store.OwnerIDForEmail("suspended@example.test")
+	if _, err := h.store.DB.Exec(`UPDATE users SET status = 'SUSPENDED' WHERE owner_id = ?`,
+		owner); err != nil {
+		t.Fatal(err)
+	}
+	nonce := h.nonce(t)
+	status, body := h.googleLogin(t, h.tokenFor(t, "suspended-google-sub", nonce, func(claims map[string]any) {
+		claims["email"] = "suspended@example.test"
+	}), nonce)
+	if status != 403 || body["code"] != "account_inactive" {
+		t.Fatalf("inactive email login = %d %#v", status, body)
+	}
+	if rows := h.countRows(t, "google_identities", owner); rows != 0 {
+		t.Fatalf("inactive account gained %d identities", rows)
 	}
 }
