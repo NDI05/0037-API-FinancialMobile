@@ -12,3 +12,5 @@ coverage.out
 tmp/
 bin/
 .DS_Store
+.vercel
+.env.local
