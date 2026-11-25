@@ -433,9 +433,15 @@ func (s *Service) importMonthPages(ctx context.Context, connection store.GmailCo
 					}
 					batchKey = fmt.Sprintf("%s:%s:p%d", prefix, target, pages)
 				}
-				counts, importedIDs, _, err := s.Store.ImportBatch(ctx, connection.OwnerID, jobID,
-					batchKey, candidatesRequestHash(candidates), pages, candidates, now)
-				if err != nil {
+				var counts store.ImportBatchCounts
+				var importedIDs []string
+				importErr := s.withDatabaseRetry(ctx, func() error {
+					var inner error
+					counts, importedIDs, _, inner = s.Store.ImportBatch(ctx, connection.OwnerID, jobID,
+						batchKey, candidatesRequestHash(candidates), pages, candidates, now)
+					return inner
+				})
+				if importErr != nil {
 					s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID, progress, "FAILED", "import_failed")
 					return pageProgress{}, err
 				}
@@ -556,10 +562,52 @@ func (s *Service) extraImportJob(ctx context.Context, ownerID, month string,
 	return job.ID, nil
 }
 
+// transientDatabaseConflict reports the write conflicts a remote libSQL database returns instead
+// of waiting for a peer writer. Retrying the bounded unit of work is safe: ImportBatch dedupes by
+// batch key and a finalize retry returns the already-finished job unchanged.
+func transientDatabaseConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"database is locked", "database table is locked", "database is busy", "sqlite_busy"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) withDatabaseRetry(ctx context.Context, work func() error) error {
+	const attempts = 4
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err = work(); err == nil || !transientDatabaseConflict(err) {
+			return err
+		}
+		if attempt == attempts-1 {
+			break
+		}
+		// The other writer's window is short; back off instead of hammering the shared database.
+		time.Sleep(time.Duration(120*(attempt+1)) * time.Millisecond)
+	}
+	return err
+}
+
 func (s *Service) finalizeMonthJob(ctx context.Context, ownerID, jobID string,
 	progress pageProgress, state, errorCode string) {
-	if _, err := s.Store.FinalizeImportJob(ctx, ownerID, jobID, state, errorCode, s.Now()); err != nil {
-		s.Log.Warn("gmail_import_finalize_failed", "state", state)
+	finalize := func() error {
+		_, err := s.Store.FinalizeImportJob(ctx, ownerID, jobID, state, errorCode, s.Now())
+		return err
+	}
+	if err := s.withDatabaseRetry(ctx, finalize); err != nil {
+		// The state alone is not actionable when a hosted import cannot finalize; keep the error
+		// text (bounded) so operators can tell a count mismatch from a database/transport failure.
+		msg := err.Error()
+		if len(msg) > 240 {
+			msg = msg[:240]
+		}
+		s.Log.Warn("gmail_import_finalize_failed", "state", state, "error", msg)
 	}
 }
 
@@ -622,10 +670,16 @@ func (s *Service) importHistoryMessages(ctx context.Context, connection store.Gm
 				end = len(candidates)
 			}
 			chunk := candidates[start:end]
-			counts, importedIDs, _, err := s.Store.ImportBatch(ctx, connection.OwnerID,
-				importJob.ID, fmt.Sprintf("delta:%s:%d", importJob.ID, start/100),
-				candidatesRequestHash(chunk), start/100, chunk, now)
-			if err != nil {
+			var counts store.ImportBatchCounts
+			var importedIDs []string
+			importErr := s.withDatabaseRetry(ctx, func() error {
+				var inner error
+				counts, importedIDs, _, inner = s.Store.ImportBatch(ctx, connection.OwnerID,
+					importJob.ID, fmt.Sprintf("delta:%s:%d", importJob.ID, start/100),
+					candidatesRequestHash(chunk), start/100, chunk, now)
+				return inner
+			})
+			if importErr != nil {
 				s.finalizeMonthJob(ctx, connection.OwnerID, importJob.ID,
 					pageProgress{Seen: seen}, "PARTIAL", "import_failed")
 				return err

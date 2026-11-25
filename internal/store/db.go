@@ -37,6 +37,9 @@ func Open(ctx context.Context, database config.Database) (*sql.DB, error) {
 	}
 	db := sql.OpenDB(connector)
 	if strings.HasPrefix(url, "libsql://") || strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "wss://") {
+		// Remote libSQL rejects concurrent writers with SQLITE_BUSY ("database is locked"); the
+		// callers retry those transient conflicts with backoff. A local file database needs one
+		// connection only because SQLite itself serialises access.
 		db.SetMaxOpenConns(8)
 	} else {
 		db.SetMaxOpenConns(1)
