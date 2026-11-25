@@ -1,0 +1,97 @@
+name: deploy-host
+
+# Deploy otomatis ke VM Azure (host UAT) setiap main lulus test.
+# Rahasia yang dibutuhkan di repo:
+#   DEPLOY_HOST      IP/domain VM (tanpa https)
+#   DEPLOY_USER      user SSH (pam)
+#   DEPLOY_PORT      port SSH (22)
+#   DEPLOY_SSH_KEY   private key ed25519 khusus CI (isi file, bukan path)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-host
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+
+      - name: Test dan build binary Linux
+        run: |
+          go vet ./...
+          go test ./... -count=1
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /tmp/pam-api ./cmd/api
+          ls -l /tmp/pam-api
+
+      - name: Siapkan SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${DEPLOY_PORT:-22}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -p "${DEPLOY_PORT:-22}" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" 'echo ssh_ok'
+
+      - name: Upload binary
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/deploy_key -P "${DEPLOY_PORT:-22}" -o BatchMode=yes \
+            /tmp/pam-api "$DEPLOY_USER@$DEPLOY_HOST:/tmp/pam-api.new"
+
+      - name: Pasang dan restart dengan rollback
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "${DEPLOY_PORT:-22}" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          if [ -f /opt/pam-api/pam-api ]; then
+            sudo -n cp -p /opt/pam-api/pam-api /opt/pam-api/pam-api.prev
+          fi
+          sudo -n install -m 0755 /tmp/pam-api.new /opt/pam-api/pam-api
+          sudo -n systemctl restart pam-api
+          ok=0
+          for i in $(seq 1 20); do
+            sleep 1
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1; then ok=1; break; fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            if [ -f /opt/pam-api/pam-api.prev ]; then
+              sudo -n install -m 0755 /opt/pam-api/pam-api.prev /opt/pam-api/pam-api
+              sudo -n systemctl restart pam-api
+            fi
+            echo "deploy_failed_health" >&2
+            exit 1
+          fi
+          rm -f /tmp/pam-api.new
+          echo "deployed_ok"
+          REMOTE
+
+      - name: Verifikasi host publik
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 10 --retry-delay 3 --retry-connrefused https://pam-70-153-86-163.sslip.io/healthz
+          curl -fsS --retry 10 --retry-delay 3 --retry-connrefused https://pam-70-153-86-163.sslip.io/readyz
+          echo "host_public_ok"
