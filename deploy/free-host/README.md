@@ -31,5 +31,14 @@ curl -fsS https://<domain>/healthz
 curl -fsS https://<domain>/readyz
 ```
 
+## Validasi artefak (25 November 2026)
+
+- `bash -n bootstrap.sh` → lolos (sintaks).
+- `Caddyfile` divalidasi dengan image resmi `caddy:2` (`caddy validate`) → **Valid configuration**.
+- Image Docker dibangun di mesin pengembang dan smoke container membuktikan `/healthz` + `/readyz`
+  **200** (DB sementara, provider fake).
+- Unit systemd belum bisa divalidasi di macOS; `bootstrap.sh` menjalankan `systemctl daemon-reload`
+  dan `systemctl restart pam-api`, jadi kesalahan unit akan terlihat langsung saat bootstrap di VM.
+
 Rollback: simpan binary lama (`cp /opt/pam-api/pam-api /opt/pam-api/pam-api.bak`),
 lalu `install -m 0755 pam-api.bak /opt/pam-api/pam-api && systemctl restart pam-api`.
