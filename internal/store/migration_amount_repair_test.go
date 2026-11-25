@@ -67,13 +67,17 @@ func TestUpgradeRepairsLegacyEmailAmounts(t *testing.T) {
 	insert("tx_legacy_v2__", "EMAIL", 123000, "gmail-livin-v2", "2026-10")
 	insert("tx_manual______", "MANUAL", 12345, nil, "2026-11")
 	insert("tx_new_v3______", "EMAIL", 2500000, "gmail-livin-v3", "2026-11")
+	// Pre-seed a revision for one repaired month so the ON CONFLICT branch of 022 is exercised.
+	if _, err := raw.ExecContext(ctx, `INSERT INTO month_revisions
+		(owner_id, month_id, revision, updated_at) VALUES ('owner-repair', '2026-09', 7, ?)`, now); err != nil {
+		t.Fatal(err)
+	}
 	raw.Close()
 
 	db, err := Open(ctx, config.Database{URL: "file:" + path})
 	if err != nil {
 		t.Fatalf("upgrade from 021 failed: %v", err)
 	}
-	defer db.Close()
 	want := map[string]int64{
 		"tx_legacy_v1__":  1_500_000,
 		"tx_legacy_v2__":  12_300_000,
@@ -90,7 +94,7 @@ func TestUpgradeRepairsLegacyEmailAmounts(t *testing.T) {
 			t.Fatalf("%s amount = %d, want %d", id, got, expected)
 		}
 	}
-	for month, expected := range map[string]int64{"2026-09": 1, "2026-10": 1} {
+	for month, expected := range map[string]int64{"2026-09": 8, "2026-10": 1} {
 		var revision int64
 		if err := db.QueryRowContext(ctx, `SELECT revision FROM month_revisions
 			WHERE owner_id = 'owner-repair' AND month_id = ?`, month).Scan(&revision); err != nil {
@@ -107,5 +111,34 @@ func TestUpgradeRepairsLegacyEmailAmounts(t *testing.T) {
 	}
 	if manualMonth != 0 {
 		t.Fatal("migration bumped a month revision without repaired rows")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening must be a no-op: schema_migrations already records 022, so a second Open cannot
+	// scale the repaired rows again.
+	reopened, err := Open(ctx, config.Database{URL: "file:" + path})
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+	for id, expected := range want {
+		var got int64
+		if err := reopened.QueryRowContext(ctx,
+			`SELECT amount_minor FROM transactions WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("reopen %s: %v", id, err)
+		}
+		if got != expected {
+			t.Fatalf("after reopen %s amount = %d, want %d", id, got, expected)
+		}
+	}
+	var revision int64
+	if err := reopened.QueryRowContext(ctx, `SELECT revision FROM month_revisions
+		WHERE owner_id = 'owner-repair' AND month_id = '2026-09'`).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	if revision != 8 {
+		t.Fatalf("after reopen revision = %d, want 8 (no second bump)", revision)
 	}
 }

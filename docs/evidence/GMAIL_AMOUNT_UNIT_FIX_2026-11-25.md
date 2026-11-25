@@ -40,7 +40,8 @@ kurang (contoh: nominal email Rp25.000 tampil Rp250). Entri manual tidak terpeng
 - `./scripts/go.sh test ./... -count=1` → **PASS 11 paket** (analysis, auth, categoryllm, config,
   crypto, finance, gmail, httpapi, llm, retention, store).
 - `TestParseIDRAmountVariants` + `TestDevFixtureRoundTripsMinorAmounts` → PASS.
-- `TestUpgradeRepairsLegacyEmailAmounts` + `TestSchemaHasExactly22Migrations` → PASS.
+- `TestUpgradeRepairsLegacyEmailAmounts` (kini juga mencakup cabang `ON CONFLICT` revisi bulan dan
+  buka-ulang DB tanpa penskalaan kedua) + `TestSchemaHasExactly21Migrations` (asersi 22 versi) → PASS.
 - **E2E terisolasi** (DB `/tmp`, port 18093, fake Gmail, bukan data pemilik): fixture minor
   `2_500_000` / `999_000` / `12_345_678` (Rp25.000 / Rp9.990 / Rp123.456,78) diimpor lewat
   connect → authorize → callback, lalu `GET /v1/transactions?month=2026-11` mengembalikan
@@ -52,6 +53,16 @@ kurang (contoh: nominal email Rp25.000 tampil Rp250). Entri manual tidak terpeng
   - 10 baris `source=MANUAL` tidak berubah (rentang `12.345…5.000.000`).
   - `schema_migrations` = 22; `month_revisions` = 13.
   - Backend UAT `127.0.0.1:18090` (`pam-api-loopback` baru) `/healthz` dan `/readyz` = 200.
+
+## Tindak lanjut audit independen (25 Nov 2026)
+
+Audit read-only commit `d42d7c4` memberi verdict PASS untuk seluruh klaim (0 P0/P1). Dua catatan
+teknisi ditindaklanjuti: distribusi baris EMAIL UAT dipastikan `gmail-livin-v1`=914 dan
+`gmail-livin-v2`=1 (semua tercakup migrasi, tidak ada NULL/legacy yang terlewat), dan tes migrasi
+diperluas untuk cabang `ON CONFLICT` + idempotensi buka-ulang. Nuansa rollback (binary lama setelah
+022 akan menulis nominal kecil lagi) didokumentasikan di `pam-app/docs/delivery/DEPLOYMENT_READINESS_NOTE_2026-11-25.md`.
+Ambiguitas format `25,5` tetap batas yang diketahui dan tidak berdampak pada format Livin nyata
+(selalu dua digit desimal).
 
 ## Batas bukti
 
