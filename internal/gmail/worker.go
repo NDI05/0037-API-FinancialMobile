@@ -62,6 +62,13 @@ func (s *Service) runBackfill(ctx context.Context, connection store.GmailConnect
 	if err := s.Store.FinishGmailSyncJob(ctx, connection.OwnerID, job.ID, "COMPLETE", "", s.Now()); err != nil {
 		return err
 	}
+	// The last backfill month completed: open the category window immediately instead of leaving
+	// the freshly imported transactions queued behind the next two-hour window.
+	if _, remaining := s.nextBackfillMonth(ctx, connection, s.Now()); !remaining {
+		if err := s.Store.ReleaseCategoryQueueNow(ctx, connection.OwnerID, s.Now()); err != nil {
+			s.Log.Warn("category_queue_release_failed", "error", err.Error())
+		}
+	}
 	return s.Store.UpdateGmailSyncState(ctx, connection.OwnerID, "idle", "", "", s.Now(), s.Now())
 }
 

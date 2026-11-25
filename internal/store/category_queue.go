@@ -141,6 +141,22 @@ func (s *Store) DeferQueuedCategoryJobs(ctx context.Context, ownerID string, due
 	return int(n), nil
 }
 
+// ReleaseCategoryQueueNow makes every PENDING job due immediately and opens the owner's queue
+// window. It runs once when the initial Gmail backfill completes so the first categorization pass
+// is not delayed by the two-hour window the jobs were enqueued under. Cost ceilings and attempt
+// quotas still bound what the drain may spend.
+func (s *Store) ReleaseCategoryQueueNow(ctx context.Context, ownerID string, now time.Time) error {
+	if _, err := s.DB.ExecContext(ctx, `UPDATE category_jobs SET due_at_unix = ?
+		WHERE owner_id = ? AND state = 'PENDING'`, now.UnixMilli(), ownerID); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE category_queue_state SET next_drain_at = ?
+		WHERE owner_id = ?`, nowString(now), ownerID); err != nil {
+		return err
+	}
+	return nil
+}
+
 // DueQueueOwners lists owners that have at least one PENDING job whose window opened, least recently
 // drained first. The backend scheduler drains these without waiting for the client to poll, and the
 // ordering keeps one busy owner from starving the others.

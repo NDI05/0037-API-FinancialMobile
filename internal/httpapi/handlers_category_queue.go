@@ -113,6 +113,15 @@ func (s *Server) enqueueCategoryJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"queued": queued, "cached": fanned, "pending": pending})
 }
 
+// categoryDrainInterval returns the configured window spacing. The 2-hour constant stays the
+// default; only an operator who accepts a faster one-time catch-up lowers it.
+func (s *Server) categoryDrainInterval() time.Duration {
+	if s.Config.CategoryLLM.DrainInterval > 0 {
+		return s.Config.CategoryLLM.DrainInterval
+	}
+	return CategoryDrainInterval
+}
+
 // drainOwnerQueue is one bounded window of the category queue. It is shared by the HTTP endpoint
 // and the backend scheduler, so an owner whose client never polls still gets drained. Within the
 // window it runs at most CategoryDrainMaxProviderCalls real provider requests (SplitCandidates may
@@ -139,7 +148,7 @@ func (s *Server) drainOwnerQueue(ctx context.Context, ownerID string, now time.T
 	if err != nil {
 		return out, err
 	}
-	next := now.Add(CategoryDrainInterval)
+	next := now.Add(s.categoryDrainInterval())
 	if pending == 0 {
 		// An empty queue has no open window: the first transaction enqueued after it must be
 		// eligible at once rather than waiting for a spend window that never spent anything.

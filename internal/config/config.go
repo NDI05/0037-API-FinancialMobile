@@ -88,6 +88,9 @@ type CategoryLLM struct {
 	InstallAttemptsDay int
 	PromptPer1K        float64
 	CompletionPer1K    float64
+	// DrainInterval is how long a drained queue window waits before the next one. The plan targets
+	// two hours; a one-time initial backfill may shrink it while the cost ceilings stay in force.
+	DrainInterval time.Duration
 }
 
 // Gmail is the Gmail API integration policy. It is disabled by default so a backend without
@@ -230,6 +233,7 @@ func Load(env map[string]string) (*Config, error) {
 			InstallAttemptsDay: intValue(env, "CATEGORY_LLM_INSTALL_ATTEMPTS_DAY", 100),
 			PromptPer1K:        floatValue(env, "CATEGORY_LLM_PRICE_PROMPT_PER_1K_USD", 0),
 			CompletionPer1K:    floatValue(env, "CATEGORY_LLM_PRICE_COMPLETION_PER_1K_USD", 0),
+			DrainInterval:      time.Duration(intValue(env, "CATEGORY_LLM_DRAIN_INTERVAL_SECONDS", 7200)) * time.Second,
 		},
 		Gmail: Gmail{
 			Enabled:               boolValue(env, "GMAIL_ENABLED", false),
@@ -331,7 +335,8 @@ func Load(env map[string]string) (*Config, error) {
 	if cfg.CategoryLLM.Enabled {
 		if cfg.CategoryLLM.Provider != "azure" || cfg.CategoryLLM.BaseURL == "" ||
 			cfg.CategoryLLM.Deployment == "" || cfg.CategoryLLM.APIKey == "" ||
-			cfg.CategoryLLM.PromptPer1K <= 0 || cfg.CategoryLLM.CompletionPer1K <= 0 {
+			cfg.CategoryLLM.PromptPer1K <= 0 || cfg.CategoryLLM.CompletionPer1K <= 0 ||
+			cfg.CategoryLLM.DrainInterval <= 0 {
 			return nil, fmt.Errorf("invalid category LLM configuration: enabled requires azure endpoint/key and verified prices")
 		}
 	}
