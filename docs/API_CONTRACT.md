@@ -48,19 +48,17 @@ Bulan `YYYY-MM` dalam **Asia/Jakarta**. Nominal selalu **integer minor IDR** (1/
 
 ```http
 POST /v1/accounts
-{ "email": "a@example.test", "password": "8..200 chars", "displayName": "A", "inviteCode": "..." }
+{ "email": "a@example.test", "password": "8..200 chars", "displayName": "A" }
 ```
-`inviteCode` **wajib untuk semua registrasi**, termasuk bila body juga membawa `invitationToken`:
-server memeriksa gate `inviteCode` lebih dulu, sebelum memilih jalur undangan. `invitationToken`
-adalah jalur legacy penerimaan undangan admin yang sudah diterbitkan; bila valid (belum dipakai,
-belum kedaluwarsa, email cocok) role diambil dari undangan, bukan dari body, dan bila tidak
-dikirim akun selalu dibuat sebagai `USER`. API pembuatan undangan baru sudah pensiun (404), jadi
-token yang beredar hanyalah undangan lama; keputusan produk OI-28 tetap terbuka (lihat §2.6).
-`201 { userId, email, displayName, role: "USER"|"ADMIN" }`. Duplicate email → `409 conflict`;
-kode undangan kosong/salah → `403 forbidden` (`invalid_invite`, token tidak diproses); token tidak
-valid/email tidak cocok → `400 invalid_invitation`; token terpakai → `409 invitation_used`; token
-kedaluwarsa → `410 invitation_expired`. Server membuat `account_keys` (kunci fingerprint) dalam
-transaksi yang sama.
+Registrasi publik **terbuka tanpa kode undangan** (keputusan pemilik 25 November 2026, menggantikan
+gate `inviteCode` CR-008). Body tidak lagi menerima `inviteCode` maupun `invitationToken`: decoder
+JSON ketat menolak field pensiun itu dengan `400 invalid_request`, sehingga token undangan lama
+tidak dapat ditukar lewat registrasi publik. Setiap akun publik selalu dibuat sebagai `USER`; role
+tidak pernah dibaca dari body.
+`201 { userId, email, displayName, role: "USER" }`. Duplicate email → `409 conflict`; email tidak
+valid atau password di luar 8..200 karakter → `400 invalid_request`. Server membuat `account_keys`
+(kunci fingerprint) dalam transaksi yang sama. Login sekaligus pendaftaran langsung lewat Google
+SSO dijelaskan di [GOOGLE_SSO_CONTRACT.md](GOOGLE_SSO_CONTRACT.md).
 
 ### 2.2 Login
 
@@ -124,16 +122,16 @@ ditolak karena sesi dicabut (bukan menunggu TTL).
 
 CR-008 memensiunkan administrasi pengguna dari cakupan produk. Build target kini hanya punya satu
 peran aplikasi, `USER`; `POST /v1/admin/invitations` dan seluruh `/v1/admin/*` tidak lagi terdaftar
-(404). Penerimaan undangan yang sudah ada tetap dipertahankan: `POST /v1/accounts` masih menerima
-`invitationToken` lama **asalkan gate `inviteCode` terpenuhi**, dan role ditentukan oleh token,
-bukan body. Tidak ada pendaftaran publik role tinggi, tidak ada pembuatan undangan baru lewat API,
-dan tidak ada auto-create akun dari Google SSO.
+(404). Registrasi publik kini terbuka tanpa kode undangan dan tidak menerima `invitationToken`
+lagi: jalur undangan legacy hanya tersisa sebagai baris data/tabel dan tidak dapat dipakai untuk
+membuat akun. Tidak ada pendaftaran publik role tinggi dan tidak ada pembuatan undangan baru lewat
+API. Google SSO dapat langsung login dan membuat akun `USER` baru (lihat GOOGLE_SSO_CONTRACT.md).
 
-**Dampak OI-28 (terbuka):** jalur pembuatan undangan admin hilang, sehingga akun `ADMIN` baru hanya
-dapat dibuat lewat CLI/ops `pam-admin -promote <email>` (akun harus sudah terdaftar; CLI idempoten
-dan menulis audit). Pedoman akademik
-D.2 (peran) perlu dipetakan ulang ke satu peran + isolasi data; keputusan produk lanjutan menunggu
-pemilik dan tidak mengubah kontrak onboarding saat ini.
+**Dampak OI-28 (sebagian tertutup 25 November 2026):** jalur pembuatan undangan admin hilang,
+sehingga akun `ADMIN` baru hanya dapat dibuat lewat CLI/ops `pam-admin -promote <email>` (akun
+harus sudah terdaftar; CLI idempoten dan menulis audit). Pendaftaran publik `USER` sekarang tanpa
+gate undangan. Pedoman akademik D.2 (peran) tetap perlu dipetakan ulang ke satu peran + isolasi
+data; keputusan produk lanjutan tetap milik pemilik.
 
 ---
 
@@ -447,8 +445,9 @@ dicatat dengan context background terbatas; bila pencatatan gagal, respons error
 konservatif tetap ada.
 
 Konfigurasi wajib produksi: `DATA_ENCRYPTION_KEY` base64 32 byte yang bukan key development;
-`JWT_SECRET`/`REFRESH_PEPPER` ≥32 byte bukan nilai development; `REGISTRATION_INVITE_CODE` bukan
-`pam-dev`. Boot produksi gagal sebelum database dibuka bila salah satu tidak aman.
+`JWT_SECRET`/`REFRESH_PEPPER` ≥32 byte bukan nilai development. Registrasi publik tidak memakai
+rahasia tambahan (tanpa kode undangan). Boot produksi gagal sebelum database dibuka bila salah satu
+tidak aman.
 Konfigurasi auth (environment backend, tidak pernah di APK):
 `JWT_SECRET` (≥32 byte), `JWT_ISSUER=pam-api`, `JWT_AUDIENCE=pam-android`,
 `ACCESS_TOKEN_TTL_SECONDS=900`, `REFRESH_TOKEN_TTL_DAYS=30`, `REFRESH_PEPPER` (≥32 byte),
@@ -488,7 +487,8 @@ DDL dan acceptance lokal ada di [`10_MIGRASI_PEDOMAN.md`](10_MIGRASI_PEDOMAN.md)
 4. Impor: batch idempoten, retry tidak menduplikasi, atomic rollback, revisi naik sekali.
 5. Ringkasan: angka cocok dengan calculator, `inputRevision` berubah setelah edit/hapus.
 6. Modul pensiun CR-008: semua method `/v1/budget-plans*`, `/v1/attachments*`, `/v1/admin/*` → 404;
-   tabel dan baris lama tetap ada; registrasi dengan `invitationToken` lama tetap berfungsi.
+   tabel dan baris lama tetap ada; registrasi publik terbuka tanpa kode undangan dan field
+   `inviteCode`/`invitationToken` ditolak `400 invalid_request`.
 7. Shadow search: hanya rentang terbatas, pagination benar, ciphertext tidak di-`LIKE`.
 10. Log/scan: tanpa PII; database cloud diuji terpisah dengan kredensial uji.
 
