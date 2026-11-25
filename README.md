@@ -61,6 +61,8 @@ dipisahkan menjadi repository ini (lihat [Asal repo](#asal-repo)).
 - **Batas provider nyata, kontrak undangan, dan coverage analisis** ([1d41f72](https://github.com/NDI05/0037-Backend-Financial/commit/1d41f72), [2e6fdea](https://github.com/NDI05/0037-Backend-Financial/commit/2e6fdea), [dd5bc88](https://github.com/NDI05/0037-Backend-Financial/commit/dd5bc88)). Panggilan provider dibatasi 4 per jendela 2 jam, kontrak undangan disamakan dengan perilaku aktual, dan payload analisis menerima `coverage` EMPTY/FAILED. *Status: lulus uji; gate final `go vet/build/test` bersih (11 paket).*
 - **Dokumen kontrak pasca-audit** ([1da82ec](https://github.com/NDI05/0037-Backend-Financial/commit/1da82ec)). Batas lampiran ditandai historis karena modulnya pensiun; kontrak API tetap menjadi acuan klien. *Status: selesai.*
 - **Satuan nominal impor Gmail diperbaiki dari laporan pemilik** ([d42d7c4](https://github.com/NDI05/0037-Backend-Financial/commit/d42d7c4)). Parser Livin mengembalikan rupiah utuh padahal kontrak API dan klien memakai minor IDR (1/100 rupiah), sehingga transaksi hasil impor email tampil 100x lebih kecil; fixture fake ikut menutupi bug karena mencetak nilai minor seolah rupiah. Parser `gmail-livin-v3` kini mengembalikan minor eksak (sen dipertahankan), fixture mencetak rupiah+sen, dan migrasi **022** memperbaiki sekali jalan 915 baris `EMAIL` pada DB UAT lokal (baris `MANUAL` tidak disentuh) sambil menaikkan revisi bulan agar cache ringkasan tidak basi. *Status: lulus vet + 11 paket tes + E2E fake-provider; audit independen PASS 0 P0/P1 (tindak lanjut: tes migrasi mencakup `ON CONFLICT` + idempotensi buka-ulang, [68f1ba4](https://github.com/NDI05/0037-Backend-Financial/commit/68f1ba4), CI success); diterapkan ke UAT lokal, deployment produksi belum.*
+- **Azure penuh untuk Analisis + Kategorisasi di UAT lokal** (tanpa perubahan kode; profil env). Pagar biaya/token diverifikasi: cache idempotensi tidak memanggil provider kedua kali, cap token+timeout, plafon harian analisis/klasifikasi, gate consent. Bukti di repo Android: `docs/evidence/AZURE_FULL_OPTIMIZATION_2026-11-25.md`. *Status: lulus smoke Azure nyata (565 token ≈ USD 0,000155/analisis); provider fake tetap untuk harness/CI.*
+- **Artefak deploy host gratis (Docker/Render/VM)** ([0b09664](https://github.com/NDI05/0037-API-FinancialMobile/commit/0b09664)). `Dockerfile` multi-stage statis non-root, `.dockerignore`, Blueprint Render free (Turso eksternal; Gmail/Azure mati default), plus `deploy/free-host/` (systemd + Caddy TLS + firewall) untuk VM Ubuntu OCI/GCP Always Free. *Status: image dibangun dan smoke `/healthz`/`/readyz` 200; CI success (run `45574878205`); deploy nyata NOT RUN sampai akun/VM pemilik.*
 
 ## Asal repo
 
@@ -107,6 +109,21 @@ dibaca dari `DATABASE_AUTH_TOKEN`; jangan pernah menaruhnya di APK, repo, log, a
 Untuk UAT, port aktif adalah `18090` (lihat `APP_ENV`, `PORT`).
 
 Health: `GET /healthz` (liveness) dan `GET /readyz` (database siap).
+
+## Deploy (host gratis / cloud)
+
+Host harus menjalankan **proses Go terus-menerus** karena worker polling Gmail hidup di dalam
+proses; Vercel Functions hanya cocok untuk demo. Artefak siap pakai:
+
+- `Dockerfile` — image multi-stage, user non-root, port `PORT` (default 8080).
+- `render.yaml` — Blueprint Render free; database tetap Turso (tanpa persistent disk).
+  Service free tidur saat idle; jangan dipakai untuk polling 24/7 tanpa keep-alive.
+- `deploy/free-host/` — bootstrap VM Ubuntu: systemd (`Restart=always`), Caddy TLS otomatis,
+  firewall 22/80/443, env rahasia di `/etc/pam/pam-api.env` mode 600.
+
+Health check platform: `/healthz`. Untuk Render, isi env `sync: false` di dashboard dan
+daftarkan redirect Gmail ke URL HTTPS service. Panduan keputusan host + langkah pemilik ada di
+[repo Android: FREE_HOST_DEPLOYMENT](https://github.com/NDI05/0037_FinancialMobile/blob/main/docs/delivery/FREE_HOST_DEPLOYMENT_2026-11-25.md).
 
 ## Google SSO
 
