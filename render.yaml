@@ -1,0 +1,58 @@
+# Blueprint Render Free (demo/UAT ringan). Database tetap di Turso (libSQL),
+# jadi tidak butuh persistent disk. Service free tidur setelah idle ±15 menit;
+# untuk polling Gmail 24/7 lihat docs/hosting gratis (OCI/GCP) di pam-app.
+services:
+  - type: web
+    name: pam-api
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: JWT_ISSUER
+        value: pam-api
+      - key: JWT_AUDIENCE
+        value: pam-android
+      - key: ACCESS_TOKEN_TTL_SECONDS
+        value: "900"
+      - key: DATA_KEY_VERSION
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_AUTH_TOKEN
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: DATA_ENCRYPTION_KEY
+        sync: false
+      - key: GOOGLE_SSO_ENABLED
+        value: "true"
+      - key: GOOGLE_SSO_CLIENT_ID
+        sync: false
+      - key: GMAIL_ENABLED
+        value: "false"
+      - key: GMAIL_MODE
+        value: polling
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REDIRECT_URI
+        sync: false
+      - key: GMAIL_DELTA_INTERVAL_SECONDS
+        value: "900"
+      - key: GMAIL_WORKER_INTERVAL_SECONDS
+        value: "60"
+      - key: GMAIL_ALLOW_LOOPBACK_REDIRECT
+        value: "false"
+      - key: CATEGORY_LLM_ENABLED
+        value: "false"
+      - key: LLM_PROVIDER
+        value: "fake"
+      - key: DAILY_AI_CEILING_USD
+        value: "0.05"

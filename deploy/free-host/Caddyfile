@@ -1,0 +1,9 @@
+# Ganti @DOMAIN@ dengan domain publik HTTPS (mis. pam-<IP>.sslip.io).
+@DOMAIN@ {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+	log {
+		output file /var/log/caddy/pam-api.log
+		format json
+	}
+}

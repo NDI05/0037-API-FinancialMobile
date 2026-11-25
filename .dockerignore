@@ -1,0 +1,14 @@
+.git
+.github
+.gitignore
+.env
+.env.*
+data
+bin
+.toolchain
+.vercel
+.DS_Store
+docs
+fixtures
+scripts
+*.md
