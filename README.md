@@ -42,8 +42,10 @@ November di bawah adalah riwayat awal yang kemudian diekstrak ke repo ini.
 
 ### 🗓️ Minggu 2 (23–29 November 2026)
 
-Minggu berjalan; riwayat tersedia sampai **Selasa 24 November 2026**. Pada 24 November backend
+Minggu berjalan dengan perubahan hingga **Rabu 25 November 2026**. Pada 24 November backend
 dipisahkan menjadi repository ini (lihat [Asal repo](#asal-repo)).
+
+- **Kategorisasi setelah backfill dan batas tanggal manual** ([77d3ef3](https://github.com/NDI05/0037-API-FinancialMobile/commit/77d3ef3)). Antrean kategorisasi awal menunggu backfill lengkap. API menolak penambahan transaksi bertanggal masa depan dan mempertahankan hasil untuk retry identik yang sebelumnya sudah tersimpan. Tes Go lulus di 11 paket, beserta vet dan build.
 
 - **Koreksi kategori pengguna mengalahkan classifier, antrean otomatis target 2 jam** ([66c0f8a](https://github.com/NDI05/0037-Backend-Financial/commit/66c0f8a), [3b1cc99](https://github.com/NDI05/0037-Backend-Financial/commit/3b1cc99), [96de52f](https://github.com/NDI05/0037-Backend-Financial/commit/96de52f), [c6fde5d](https://github.com/NDI05/0037-Backend-Financial/commit/c6fde5d)). Hasil dipetakan lewat `caseId`, orphan disapu atomik, lease di-fence, dan antrean kategori berjalan otomatis dengan indikator pembaruan. *Status: lulus uji + bukti runtime saat itu.*
 - **Kontrak server S2.4: paging, revisi, dan coverage ringkasan** ([edab1c6](https://github.com/NDI05/0037-Backend-Financial/commit/edab1c6)). Halaman/revisi transaksi dan `coverage` ringkasan (COMPLETE/PARTIAL/EMPTY/FAILED) menjadi kontrak resmi klien. *Status: lulus uji kontrak.*
